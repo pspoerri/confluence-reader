@@ -6,7 +6,7 @@ GOFLAGS :=
 export GOCACHE  ?= $(shell go env GOCACHE 2>/dev/null || echo /tmp/go-cache)
 export GOPATH   ?= $(shell go env GOPATH 2>/dev/null || echo /tmp/gopath)
 
-.PHONY: all build test test-v test-race vet fmt fmt-check clean install install-skill help
+.PHONY: all build test test-v test-race vet fmt fmt-check clean install install-hooks install-skill help
 
 all: fmt-check vet test build ## Run checks, tests, and build (default)
 
@@ -33,6 +33,10 @@ fmt-check: ## Check formatting (fails if unformatted)
 
 clean: ## Remove build artifacts
 	rm -f $(BINARY)
+
+install-hooks: ## Install git pre-commit hooks
+	cp githooks/pre-commit .git/hooks/pre-commit
+	chmod +x .git/hooks/pre-commit
 
 INSTALL_DIR := $(HOME)/.local/bin
 

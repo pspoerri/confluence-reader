@@ -80,6 +80,7 @@ Makefile                     -- Build, test, install targets
 | `fmt`       | Format all Go files                                  |
 | `fmt-check` | Check formatting (fails if unformatted)              |
 | `clean`     | Remove build artifacts                               |
+| `install-hooks` | Install git pre-commit hooks                     |
 | `install`   | Build and install binary to `~/.local/bin/`          |
 | `help`      | Show available targets                               |
 

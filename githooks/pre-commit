@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Pre-commit hook: run gofmt on staged Go files and re-stage them.
+
+# Find staged .go files (Added, Copied, Modified, Renamed).
+gofiles=$(git diff --cached --name-only --diff-filter=ACMR -- '*.go')
+
+if [ -z "$gofiles" ]; then
+    exit 0
+fi
+
+# Format only the staged Go files.
+gofmt -w $gofiles
+
+# Re-stage them so the formatted version is what gets committed.
+git add $gofiles
+
+exit 0

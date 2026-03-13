@@ -18,7 +18,7 @@ Options:
 Commands:
   configure                              Set up Confluence credentials
   spaces                                 List all accessible spaces
-  ls <space-key>                         List page tree in a space
+  tree <space-key>                       List page tree in a space
   find <space-key> [query]               Find pages by title (or list all)
   read <space-key> <page-id>             Read a page as markdown
   read-file <space-key> <page-id> <filename>
@@ -82,11 +82,11 @@ func main() {
 	case "spaces":
 		err = app.RunSpaces()
 
-	case "ls":
+	case "tree":
 		if len(args) < 1 {
-			die("usage: confluence-reader ls <space-key>")
+			die("usage: confluence-reader tree <space-key>")
 		}
-		err = app.RunLS(args[0])
+		err = app.RunTree(args[0])
 
 	case "find":
 		if len(args) < 1 {

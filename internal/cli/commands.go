@@ -75,8 +75,8 @@ func (a *App) resolveSpace(spaceKey string) (*api.Space, error) {
 	return nil, fmt.Errorf("space %q not found", spaceKey)
 }
 
-// RunLS lists pages in a space as a tree.
-func (a *App) RunLS(spaceKey string) error {
+// RunTree lists pages in a space as a tree.
+func (a *App) RunTree(spaceKey string) error {
 	space, err := a.resolveSpace(spaceKey)
 	if err != nil {
 		return err

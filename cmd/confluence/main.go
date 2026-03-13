@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/pascal/confluence-reader/internal/cli"
 )
@@ -18,6 +19,7 @@ Options:
 Commands:
   configure                              Set up Confluence credentials
   spaces                                 List all accessible spaces
+  ls [-l] <space-key> [page-id|/path]    List child pages (like unix ls)
   tree <space-key>                       List page tree in a space
   find <space-key> [query]               Find pages by title (or list all)
   read <space-key> <page-id>             Read a page as markdown
@@ -81,6 +83,28 @@ func main() {
 	switch cmd {
 	case "spaces":
 		err = app.RunSpaces()
+
+	case "ls":
+		// Parse ls-specific flags: -l for long format.
+		longFormat := false
+		lsArgs := args
+		for len(lsArgs) > 0 && strings.HasPrefix(lsArgs[0], "-") {
+			switch lsArgs[0] {
+			case "-l", "--long":
+				longFormat = true
+			default:
+				die("ls: unknown flag: " + lsArgs[0])
+			}
+			lsArgs = lsArgs[1:]
+		}
+		if len(lsArgs) < 1 {
+			die("usage: confluence-reader ls [-l] <space-key> [page-id|/path]")
+		}
+		target := ""
+		if len(lsArgs) >= 2 {
+			target = lsArgs[1]
+		}
+		err = app.RunLs(lsArgs[0], target, longFormat)
 
 	case "tree":
 		if len(args) < 1 {

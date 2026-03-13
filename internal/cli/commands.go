@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/pascal/confluence-reader/internal/api"
 	"github.com/pascal/confluence-reader/internal/cache"
@@ -73,6 +74,128 @@ func (a *App) resolveSpace(spaceKey string) (*api.Space, error) {
 		}
 	}
 	return nil, fmt.Errorf("space %q not found", spaceKey)
+}
+
+// RunLs lists pages like unix ls. With no target it lists root pages; with a
+// page ID or slash-path it lists children of that page. Output includes type
+// indicator, page ID, title, modified/created timestamps, and last editor.
+func (a *App) RunLs(spaceKey, target string, longFormat bool) error {
+	space, err := a.resolveSpace(spaceKey)
+	if err != nil {
+		return err
+	}
+
+	cs, err := a.Cache.EnsureLoaded(a.Client, *space)
+	if err != nil {
+		return err
+	}
+
+	if len(cs.Pages) == 0 {
+		fmt.Printf("No pages in space %s.\n", spaceKey)
+		return nil
+	}
+
+	roots := cache.BuildTree(cs.Pages)
+	sortNodes(roots)
+
+	// Resolve target to a page node.
+	var parent *cache.PageNode
+	var children []*cache.PageNode
+
+	if target == "" || target == "/" {
+		// List roots.
+		children = roots
+	} else if strings.HasPrefix(target, "/") {
+		// Path-based lookup.
+		parent = cache.FindNodeByPath(roots, target)
+		if parent == nil {
+			return fmt.Errorf("path not found: %s", target)
+		}
+		children = parent.Children
+	} else {
+		// Try page ID lookup first, fall back to path.
+		parent = cache.FindNode(roots, target)
+		if parent == nil {
+			parent = cache.FindNodeByPath(roots, target)
+		}
+		if parent == nil {
+			return fmt.Errorf("page not found: %s", target)
+		}
+		children = parent.Children
+	}
+
+	sortNodes(children)
+
+	if len(children) == 0 {
+		if parent != nil {
+			fmt.Fprintf(os.Stderr, "%s has no child pages\n", parent.Page.Title)
+		} else {
+			fmt.Println("No pages found.")
+		}
+		return nil
+	}
+
+	if !longFormat {
+		// Short format: just titles, directories get trailing /
+		for _, child := range children {
+			name := child.Page.Title
+			if len(child.Children) > 0 {
+				name += "/"
+			}
+			fmt.Println(name)
+		}
+		return nil
+	}
+
+	// Long format: tabular output similar to ls -l
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintf(w, "TYPE\tID\tTITLE\tMODIFIED\tCREATED\tLAST EDITOR\n")
+	fmt.Fprintf(w, "----\t--\t-----\t--------\t-------\t-----------\n")
+	for _, child := range children {
+		kind := "page"
+		if len(child.Children) > 0 {
+			kind = "dir"
+		}
+
+		modified := formatTime(child.Page.Version.CreatedAt)
+		created := formatTime(child.Page.CreatedAt)
+		editor := child.Page.Version.AuthorID
+
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			kind, child.Page.ID, child.Page.Title, modified, created, editor)
+	}
+	w.Flush()
+
+	// Summary line to stderr.
+	location := "/"
+	if parent != nil {
+		location = cache.PagePath(cs.Pages, parent.Page.ID)
+	}
+	fmt.Fprintf(os.Stderr, "\n%d items in %s\n", len(children), location)
+	return nil
+}
+
+// formatTime parses an API timestamp and returns a short human-readable form.
+func formatTime(raw string) string {
+	if raw == "" {
+		return "-"
+	}
+	// Confluence v2 API uses RFC 3339 / ISO 8601.
+	for _, layout := range []string{
+		"2006-01-02T15:04:05.000Z",
+		"2006-01-02T15:04:05Z",
+		"2006-01-02T15:04:05.000-07:00",
+		"2006-01-02T15:04:05-07:00",
+	} {
+		if t, err := time.Parse(layout, raw); err == nil {
+			return t.Format("Jan 02 15:04")
+		}
+	}
+	// Fallback: return first 16 chars.
+	if len(raw) > 16 {
+		return raw[:16]
+	}
+	return raw
 }
 
 // RunTree lists pages in a space as a tree.

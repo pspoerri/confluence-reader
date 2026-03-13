@@ -152,6 +152,58 @@ func FindPages(pages []api.Page, query string) []api.Page {
 	return results
 }
 
+// FindNode searches a tree for a node by page ID.
+func FindNode(roots []*PageNode, pageID string) *PageNode {
+	for _, root := range roots {
+		if root.Page.ID == pageID {
+			return root
+		}
+		if found := FindNode(root.Children, pageID); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+// FindNodeByPath resolves a slash-separated path (e.g. "/Parent/Child") to a node.
+// Path matching is case-insensitive. Leading and trailing slashes are ignored.
+func FindNodeByPath(roots []*PageNode, path string) *PageNode {
+	path = strings.Trim(path, "/")
+	if path == "" {
+		return nil
+	}
+	parts := strings.Split(path, "/")
+	return findNodeByParts(roots, parts)
+}
+
+func findNodeByParts(nodes []*PageNode, parts []string) *PageNode {
+	if len(parts) == 0 || len(nodes) == 0 {
+		return nil
+	}
+	target := strings.ToLower(parts[0])
+	for _, n := range nodes {
+		if strings.ToLower(n.Page.Title) == target {
+			if len(parts) == 1 {
+				return n
+			}
+			return findNodeByParts(n.Children, parts[1:])
+		}
+	}
+	return nil
+}
+
+// ChildPages returns the direct children of a page, or the roots if pageID is empty.
+func ChildPages(roots []*PageNode, pageID string) []*PageNode {
+	if pageID == "" {
+		return roots
+	}
+	node := FindNode(roots, pageID)
+	if node == nil {
+		return nil
+	}
+	return node.Children
+}
+
 // PagePath returns the slash-separated path from root to the given page.
 func PagePath(pages []api.Page, pageID string) string {
 	index := make(map[string]*api.Page, len(pages))

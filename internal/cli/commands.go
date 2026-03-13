@@ -76,10 +76,22 @@ func (a *App) resolveSpace(spaceKey string) (*api.Space, error) {
 	return nil, fmt.Errorf("space %q not found", spaceKey)
 }
 
+// lsEntry is a single item in an ls listing. It can represent a child page
+// (shown as a directory), the virtual index.md, or an attachment file.
+type lsEntry struct {
+	Perms    string // unix-style permissions, e.g. "rwx"
+	Name     string // display name, e.g. "ChildPage/", "index.md", "photo.png"
+	Modified string // formatted timestamp
+	Creator  string // author/editor ID
+}
+
 // RunLs lists pages like unix ls. Every page in Confluence is a directory that
 // can contain child pages. With no target it lists root pages; with a page ID
 // or slash-path it lists children of that page. When targeting a leaf page
 // (no children) it displays the page's own metadata, like ls on a single file.
+//
+// Inside every "directory" that has children, a virtual index.md entry
+// represents the page's own content. Attachments are shown as files.
 func (a *App) RunLs(spaceKey, target string, longFormat bool) error {
 	space, err := a.resolveSpace(spaceKey)
 	if err != nil {
@@ -99,78 +111,119 @@ func (a *App) RunLs(spaceKey, target string, longFormat bool) error {
 	roots := cache.BuildTree(cs.Pages)
 	sortNodes(roots)
 
+	// Visible roots: skip the space homepage wrapper.
+	visibleRoots := roots
+	if space.HomepageID != "" {
+		if hp := cache.FindNode(roots, space.HomepageID); hp != nil {
+			visibleRoots = hp.Children
+		}
+	}
+
 	// Resolve target to a page node.
 	var parent *cache.PageNode
-	var entries []*cache.PageNode
 
-	if target == "" || target == "/" {
-		// List root pages.
-		entries = roots
-	} else {
-		// Resolve target: try page ID first, then slash-path.
+	if target != "" && target != "/" {
 		if strings.HasPrefix(target, "/") {
-			parent = cache.FindNodeByPath(roots, target)
+			parent = cache.FindNodeByPath(visibleRoots, target)
 		} else {
 			parent = cache.FindNode(roots, target)
 			if parent == nil {
-				parent = cache.FindNodeByPath(roots, target)
+				parent = cache.FindNodeByPath(visibleRoots, target)
 			}
 		}
 		if parent == nil {
 			return fmt.Errorf("page not found: %s", target)
 		}
-
-		if len(parent.Children) == 0 {
-			// Leaf page: show the page itself, like `ls somefile`.
-			entries = []*cache.PageNode{parent}
-		} else {
-			entries = parent.Children
-		}
 	}
 
-	sortNodes(entries)
+	// Build the listing entries.
+	var entries []lsEntry
+	perms := operationsToPerms(cs.Operations)
+
+	if parent == nil {
+		// Root listing: show homepage content as index.md, its child pages
+		// as directories, and any homepage attachments as files.
+		if space.HomepageID != "" {
+			if hp := cache.FindNode(roots, space.HomepageID); hp != nil {
+				entries = append(entries, lsEntry{
+					Perms:    perms,
+					Name:     "index.md",
+					Modified: formatTime(hp.Page.Version.CreatedAt),
+					Creator:  hp.Page.Version.AuthorID,
+				})
+				entries = append(entries, attachmentEntries(cs, hp.Page.ID, perms)...)
+			}
+		}
+		for _, node := range visibleRoots {
+			entries = append(entries, nodeEntry(node, perms))
+		}
+	} else {
+		// Inside a page: index.md (page content) + child folders + attachments.
+		entries = append(entries, lsEntry{
+			Perms:    perms,
+			Name:     "index.md",
+			Modified: formatTime(parent.Page.Version.CreatedAt),
+			Creator:  parent.Page.Version.AuthorID,
+		})
+		for _, child := range parent.Children {
+			entries = append(entries, nodeEntry(child, perms))
+		}
+		entries = append(entries, attachmentEntries(cs, parent.Page.ID, perms)...)
+	}
 
 	if len(entries) == 0 {
 		fmt.Println("No pages found.")
 		return nil
 	}
 
-	if !longFormat {
-		for _, entry := range entries {
-			name := entry.Page.Title
-			if len(entry.Children) > 0 {
-				name += "/"
-			}
-			fmt.Println(name)
-		}
-		return nil
-	}
-
-	// Long format: tabular output similar to ls -l.
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintf(w, "ID\tTITLE\tMODIFIED\tCREATED\tLAST EDITOR\n")
-	fmt.Fprintf(w, "--\t-----\t--------\t-------\t-----------\n")
-	for _, entry := range entries {
-		title := entry.Page.Title
-		if len(entry.Children) > 0 {
-			title += "/"
-		}
-		modified := formatTime(entry.Page.Version.CreatedAt)
-		created := formatTime(entry.Page.CreatedAt)
-		editor := entry.Page.Version.AuthorID
-
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
-			entry.Page.ID, title, modified, created, editor)
+	if longFormat {
+		fmt.Fprintf(w, "PERMS\tNAME\tMODIFIED\tCREATOR\n")
+		fmt.Fprintf(w, "-----\t----\t--------\t-------\n")
+	}
+	for _, e := range entries {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", e.Perms, e.Name, e.Modified, e.Creator)
 	}
 	w.Flush()
 
-	// Summary line to stderr.
-	location := "/"
-	if parent != nil {
-		location = cache.PagePath(cs.Pages, parent.Page.ID)
+	if longFormat {
+		// Summary line to stderr.
+		location := "/"
+		if parent != nil {
+			location = cache.PagePath(cs.Pages, parent.Page.ID)
+		}
+		fmt.Fprintf(os.Stderr, "\n%d items in %s\n", len(entries), location)
 	}
-	fmt.Fprintf(os.Stderr, "\n%d items in %s\n", len(entries), location)
 	return nil
+}
+
+// nodeEntry creates an lsEntry for a child page node.
+func nodeEntry(node *cache.PageNode, perms string) lsEntry {
+	name := node.Page.Title + "/"
+	return lsEntry{
+		Perms:    perms,
+		Name:     name,
+		Modified: formatTime(node.Page.Version.CreatedAt),
+		Creator:  node.Page.Version.AuthorID,
+	}
+}
+
+// attachmentEntries creates lsEntries for all cached attachments of a page.
+func attachmentEntries(cs *cache.CachedSpace, pageID string, perms string) []lsEntry {
+	atts := cs.Attachments[pageID]
+	if len(atts) == 0 {
+		return nil
+	}
+	entries := make([]lsEntry, 0, len(atts))
+	for _, att := range atts {
+		entries = append(entries, lsEntry{
+			Perms:    perms,
+			Name:     att.Title,
+			Modified: formatTime(att.Version.CreatedAt),
+			Creator:  att.Version.AuthorID,
+		})
+	}
+	return entries
 }
 
 // formatTime parses an API timestamp and returns a short human-readable form.
@@ -196,6 +249,34 @@ func formatTime(raw string) string {
 	return raw
 }
 
+// operationsToPerms converts a list of Confluence space operations to a
+// unix-style permissions string: r=read, w=create/update, x=delete.
+func operationsToPerms(ops []api.Operation) string {
+	var canRead, canWrite, canDelete bool
+	for _, op := range ops {
+		switch op.Operation {
+		case "read":
+			canRead = true
+		case "create", "update":
+			canWrite = true
+		case "delete":
+			canDelete = true
+		}
+	}
+
+	perm := [3]byte{'-', '-', '-'}
+	if canRead {
+		perm[0] = 'r'
+	}
+	if canWrite {
+		perm[1] = 'w'
+	}
+	if canDelete {
+		perm[2] = 'x'
+	}
+	return string(perm[:])
+}
+
 // RunTree lists pages in a space as a tree.
 func (a *App) RunTree(spaceKey string) error {
 	space, err := a.resolveSpace(spaceKey)
@@ -215,8 +296,17 @@ func (a *App) RunTree(spaceKey string) error {
 
 	roots := cache.BuildTree(cs.Pages)
 	sortNodes(roots)
-	for _, root := range roots {
-		printTree(os.Stdout, root, "", true)
+
+	// Skip the homepage wrapper — show its children as the top-level tree.
+	displayRoots := roots
+	if space.HomepageID != "" {
+		if hp := cache.FindNode(roots, space.HomepageID); hp != nil {
+			displayRoots = hp.Children
+		}
+	}
+
+	for i, root := range displayRoots {
+		printTree(os.Stdout, root, "", i == len(displayRoots)-1)
 	}
 
 	fmt.Printf("\n(%d pages, cached %s)\n", len(cs.Pages), cs.UpdatedAt.Format("2006-01-02 15:04:05"))
@@ -280,10 +370,66 @@ func (a *App) RunFind(spaceKey, query string) error {
 	return nil
 }
 
-// RunRead reads a page by ID, converts to markdown, includes attachment refs.
-func (a *App) RunRead(spaceKey, pageID string) error {
-	// Verify page belongs to the space scope.
+// resolvePageID resolves a target that can be a page ID, a slash-separated
+// path (e.g. "/Parent/Child"), or a bare page title to the actual page ID.
+// Paths ending in /index.md are normalised by stripping the suffix.
+func (a *App) resolvePageID(space *api.Space, target string) (string, error) {
+	// Strip trailing /index.md — the virtual entry that represents
+	// a page's own content in ls listings.
+	target = strings.TrimSuffix(target, "/index.md")
+	target = strings.TrimSuffix(target, "/index.MD")
+
+	// If the target looks like a plain numeric page ID, try using it directly.
+	if !strings.Contains(target, "/") {
+		if _, err := a.Client.GetPageByID(target); err == nil {
+			return target, nil
+		}
+	}
+
+	// Otherwise resolve via the cached page tree.
+	cs, err := a.Cache.EnsureLoaded(a.Client, *space)
+	if err != nil {
+		return "", err
+	}
+	if len(cs.Pages) == 0 {
+		return "", fmt.Errorf("no pages in space %s", space.Key)
+	}
+
+	roots := cache.BuildTree(cs.Pages)
+	sortNodes(roots)
+
+	// Visible roots: skip the space homepage wrapper.
+	visibleRoots := roots
+	if space.HomepageID != "" {
+		if hp := cache.FindNode(roots, space.HomepageID); hp != nil {
+			visibleRoots = hp.Children
+		}
+	}
+
+	var node *cache.PageNode
+	if strings.HasPrefix(target, "/") {
+		node = cache.FindNodeByPath(visibleRoots, target)
+	} else {
+		// Try as page ID first, then as a path/title.
+		node = cache.FindNode(roots, target)
+		if node == nil {
+			node = cache.FindNodeByPath(visibleRoots, target)
+		}
+	}
+	if node == nil {
+		return "", fmt.Errorf("page not found: %s", target)
+	}
+	return node.Page.ID, nil
+}
+
+// RunRead reads a page by ID or path, converts to markdown, includes attachment refs.
+func (a *App) RunRead(spaceKey, target string) error {
 	space, err := a.resolveSpace(spaceKey)
+	if err != nil {
+		return err
+	}
+
+	pageID, err := a.resolvePageID(space, target)
 	if err != nil {
 		return err
 	}
@@ -319,9 +465,14 @@ func (a *App) RunRead(spaceKey, pageID string) error {
 	return nil
 }
 
-// RunReadFile downloads an attachment by page ID and filename.
-func (a *App) RunReadFile(spaceKey, pageID, filename string) error {
+// RunReadFile downloads an attachment by page ID (or path) and filename.
+func (a *App) RunReadFile(spaceKey, target, filename string) error {
 	space, err := a.resolveSpace(spaceKey)
+	if err != nil {
+		return err
+	}
+
+	pageID, err := a.resolvePageID(space, target)
 	if err != nil {
 		return err
 	}
@@ -340,20 +491,20 @@ func (a *App) RunReadFile(spaceKey, pageID, filename string) error {
 		return err
 	}
 
-	var target *api.Attachment
+	var att *api.Attachment
 	for _, a := range attachments {
 		if strings.EqualFold(a.Title, filename) {
-			target = &a
+			att = &a
 			break
 		}
 	}
-	if target == nil {
+	if att == nil {
 		return fmt.Errorf("attachment %q not found on page %s", filename, pageID)
 	}
 
-	downloadPath := target.Links.Download
+	downloadPath := att.Links.Download
 	if downloadPath == "" {
-		downloadPath = target.DownloadLink
+		downloadPath = att.DownloadLink
 	}
 	if downloadPath == "" {
 		return fmt.Errorf("no download link for attachment %q", filename)
@@ -367,14 +518,14 @@ func (a *App) RunReadFile(spaceKey, pageID, filename string) error {
 
 	contentType := resp.Header.Get("Content-Type")
 	fmt.Fprintf(os.Stderr, "Content-Type: %s\n", contentType)
-	fmt.Fprintf(os.Stderr, "Filename: %s\n", target.Title)
-	fmt.Fprintf(os.Stderr, "Size: %d bytes\n", target.FileSize)
+	fmt.Fprintf(os.Stderr, "Filename: %s\n", att.Title)
+	fmt.Fprintf(os.Stderr, "Size: %d bytes\n", att.FileSize)
 
 	if strings.HasPrefix(contentType, "text/") {
 		_, err = io.Copy(os.Stdout, resp.Body)
 	} else {
 		// Write binary to file in current directory.
-		outFile, ferr := os.Create(target.Title)
+		outFile, ferr := os.Create(att.Title)
 		if ferr != nil {
 			return fmt.Errorf("create output file: %w", ferr)
 		}
@@ -383,7 +534,7 @@ func (a *App) RunReadFile(spaceKey, pageID, filename string) error {
 		if cerr != nil {
 			return fmt.Errorf("write output file: %w", cerr)
 		}
-		fmt.Fprintf(os.Stderr, "Written to %s (%d bytes)\n", target.Title, n)
+		fmt.Fprintf(os.Stderr, "Written to %s (%d bytes)\n", att.Title, n)
 	}
 
 	return err

@@ -22,8 +22,8 @@ Commands:
   ls [-l] <space-key> [page-id|/path]    List child pages (like unix ls)
   tree <space-key>                       List page tree in a space
   find <space-key> [query]               Find pages by title (or list all)
-  read <space-key> <page-id>             Read a page as markdown
-  read-file <space-key> <page-id> <filename>
+  read <space-key> <page-id|/path>      Read a page as markdown
+  read-file <space-key> <page-id|/path> <filename>
                                          Download an attachment
   refresh <space-key>                    Refresh the local cache for a space
 
@@ -124,13 +124,13 @@ func main() {
 
 	case "read":
 		if len(args) < 2 {
-			die("usage: confluence-reader read <space-key> <page-id>")
+			die("usage: confluence-reader read <space-key> <page-id|/path>")
 		}
 		err = app.RunRead(args[0], args[1])
 
 	case "read-file":
 		if len(args) < 3 {
-			die("usage: confluence-reader read-file <space-key> <page-id> <filename>")
+			die("usage: confluence-reader read-file <space-key> <page-id|/path> <filename>")
 		}
 		err = app.RunReadFile(args[0], args[1], args[2])
 

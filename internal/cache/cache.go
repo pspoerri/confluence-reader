@@ -8,8 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pascal/confluence-reader/internal/api"
-	"github.com/pascal/confluence-reader/internal/config"
+	"github.com/pspoerri/confluence-reader/internal/api"
+	"github.com/pspoerri/confluence-reader/internal/config"
 )
 
 // CachedSpace stores space metadata and its page tree.

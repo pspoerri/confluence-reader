@@ -5,7 +5,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/pascal/confluence-reader/internal/api"
+	"github.com/pspoerri/confluence-reader/internal/api"
 )
 
 // ToMarkdown converts Confluence storage format HTML into Markdown.

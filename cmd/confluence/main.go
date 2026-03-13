@@ -5,7 +5,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/pascal/confluence-reader/internal/cli"
+	"github.com/pspoerri/confluence-reader/internal/cli"
 )
 
 const usage = `confluence-reader - browse Confluence spaces like a filesystem

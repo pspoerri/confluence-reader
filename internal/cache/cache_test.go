@@ -3,7 +3,7 @@ package cache
 import (
 	"testing"
 
-	"github.com/pascal/confluence-reader/internal/api"
+	"github.com/pspoerri/confluence-reader/internal/api"
 )
 
 func TestBuildTree(t *testing.T) {

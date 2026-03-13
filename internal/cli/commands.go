@@ -10,10 +10,10 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/pascal/confluence-reader/internal/api"
-	"github.com/pascal/confluence-reader/internal/cache"
-	"github.com/pascal/confluence-reader/internal/config"
-	"github.com/pascal/confluence-reader/internal/convert"
+	"github.com/pspoerri/confluence-reader/internal/api"
+	"github.com/pspoerri/confluence-reader/internal/cache"
+	"github.com/pspoerri/confluence-reader/internal/config"
+	"github.com/pspoerri/confluence-reader/internal/convert"
 )
 
 // App holds the shared state for all CLI commands.

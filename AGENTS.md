@@ -93,7 +93,7 @@ Makefile                     -- Build, test, install targets
 - Group imports in three blocks separated by blank lines:
   1. Standard library
   2. External dependencies (none currently)
-  3. Internal packages (`github.com/pascal/confluence-reader/internal/...`)
+  3. Internal packages (`github.com/pspoerri/confluence-reader/internal/...`)
 - Use `goimports` to manage import ordering automatically.
 
 ### Naming

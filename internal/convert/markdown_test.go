@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pascal/confluence-reader/internal/api"
+	"github.com/pspoerri/confluence-reader/internal/api"
 )
 
 func TestToMarkdown_Headings(t *testing.T) {

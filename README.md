@@ -165,9 +165,9 @@ make fmt-check    # Check formatting (CI)
 make clean        # Remove build artifacts
 ```
 
-### OpenCode skill
+### AI tool skill
 
-confluence-reader ships with an [OpenCode](https://opencode.ai) skill that lets AI agents use the tool to browse Confluence. To install the skill globally:
+confluence-reader ships with a skill definition (`.opencode/skills/confluence-reader/SKILL.md`) that lets AI coding tools (OpenCode, Claude, etc.) use the tool to browse Confluence. To install the skill globally for OpenCode:
 
 ```bash
 make install-skill

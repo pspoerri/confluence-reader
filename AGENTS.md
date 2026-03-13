@@ -65,6 +65,9 @@ internal/
     markdown_test.go
 config.example.json          -- Template config file for users
 Makefile                     -- Build, test, install targets
+.opencode/skills/
+  confluence-reader/
+    SKILL.md                 -- Skill definition for AI coding tools (keep in sync with README)
 ```
 
 ## Makefile Targets
@@ -82,6 +85,7 @@ Makefile                     -- Build, test, install targets
 | `clean`     | Remove build artifacts                               |
 | `install-hooks` | Install git pre-commit hooks                     |
 | `install`   | Build and install binary to `~/.local/bin/`          |
+| `install-skill` | Install binary and skill definition globally     |
 | `help`      | Show available targets                               |
 
 ## Code Style
@@ -154,7 +158,16 @@ Makefile                     -- Build, test, install targets
 1. Add the handler method on `App` in `internal/cli/commands.go`.
 2. Add the command case in `cmd/confluence/main.go` switch.
 3. Update the `usage` constant in `main.go`.
-4. Add tests if the command has testable logic.
+4. Update `README.md` and `.opencode/skills/confluence-reader/SKILL.md` with the new command.
+5. Add tests if the command has testable logic.
+
+## Skill File
+
+The file `.opencode/skills/confluence-reader/SKILL.md` is a skill definition used by AI coding tools (OpenCode, Claude, etc.) to understand how to use the `confluence-reader` CLI. It describes available commands, navigation, configuration, and typical workflows.
+
+**Keep the skill file in sync with the README.** When you add, remove, or change commands, options, or usage patterns, update both `README.md` and `SKILL.md`. The command table, configuration section, and workflow examples in the skill file should match the README.
+
+The skill can be installed globally via `make install-skill`.
 
 ## Dependencies
 

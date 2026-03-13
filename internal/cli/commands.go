@@ -76,9 +76,10 @@ func (a *App) resolveSpace(spaceKey string) (*api.Space, error) {
 	return nil, fmt.Errorf("space %q not found", spaceKey)
 }
 
-// RunLs lists pages like unix ls. With no target it lists root pages; with a
-// page ID or slash-path it lists children of that page. Output includes type
-// indicator, page ID, title, modified/created timestamps, and last editor.
+// RunLs lists pages like unix ls. Every page in Confluence is a directory that
+// can contain child pages. With no target it lists root pages; with a page ID
+// or slash-path it lists children of that page. When targeting a leaf page
+// (no children) it displays the page's own metadata, like ls on a single file.
 func (a *App) RunLs(spaceKey, target string, longFormat bool) error {
 	space, err := a.resolveSpace(spaceKey)
 	if err != nil {
@@ -100,46 +101,44 @@ func (a *App) RunLs(spaceKey, target string, longFormat bool) error {
 
 	// Resolve target to a page node.
 	var parent *cache.PageNode
-	var children []*cache.PageNode
+	var entries []*cache.PageNode
 
 	if target == "" || target == "/" {
-		// List roots.
-		children = roots
-	} else if strings.HasPrefix(target, "/") {
-		// Path-based lookup.
-		parent = cache.FindNodeByPath(roots, target)
-		if parent == nil {
-			return fmt.Errorf("path not found: %s", target)
-		}
-		children = parent.Children
+		// List root pages.
+		entries = roots
 	} else {
-		// Try page ID lookup first, fall back to path.
-		parent = cache.FindNode(roots, target)
-		if parent == nil {
+		// Resolve target: try page ID first, then slash-path.
+		if strings.HasPrefix(target, "/") {
 			parent = cache.FindNodeByPath(roots, target)
+		} else {
+			parent = cache.FindNode(roots, target)
+			if parent == nil {
+				parent = cache.FindNodeByPath(roots, target)
+			}
 		}
 		if parent == nil {
 			return fmt.Errorf("page not found: %s", target)
 		}
-		children = parent.Children
+
+		if len(parent.Children) == 0 {
+			// Leaf page: show the page itself, like `ls somefile`.
+			entries = []*cache.PageNode{parent}
+		} else {
+			entries = parent.Children
+		}
 	}
 
-	sortNodes(children)
+	sortNodes(entries)
 
-	if len(children) == 0 {
-		if parent != nil {
-			fmt.Fprintf(os.Stderr, "%s has no child pages\n", parent.Page.Title)
-		} else {
-			fmt.Println("No pages found.")
-		}
+	if len(entries) == 0 {
+		fmt.Println("No pages found.")
 		return nil
 	}
 
 	if !longFormat {
-		// Short format: just titles, directories get trailing /
-		for _, child := range children {
-			name := child.Page.Title
-			if len(child.Children) > 0 {
+		for _, entry := range entries {
+			name := entry.Page.Title
+			if len(entry.Children) > 0 {
 				name += "/"
 			}
 			fmt.Println(name)
@@ -147,22 +146,21 @@ func (a *App) RunLs(spaceKey, target string, longFormat bool) error {
 		return nil
 	}
 
-	// Long format: tabular output similar to ls -l
+	// Long format: tabular output similar to ls -l.
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintf(w, "TYPE\tID\tTITLE\tMODIFIED\tCREATED\tLAST EDITOR\n")
-	fmt.Fprintf(w, "----\t--\t-----\t--------\t-------\t-----------\n")
-	for _, child := range children {
-		kind := "page"
-		if len(child.Children) > 0 {
-			kind = "dir"
+	fmt.Fprintf(w, "ID\tTITLE\tMODIFIED\tCREATED\tLAST EDITOR\n")
+	fmt.Fprintf(w, "--\t-----\t--------\t-------\t-----------\n")
+	for _, entry := range entries {
+		title := entry.Page.Title
+		if len(entry.Children) > 0 {
+			title += "/"
 		}
+		modified := formatTime(entry.Page.Version.CreatedAt)
+		created := formatTime(entry.Page.CreatedAt)
+		editor := entry.Page.Version.AuthorID
 
-		modified := formatTime(child.Page.Version.CreatedAt)
-		created := formatTime(child.Page.CreatedAt)
-		editor := child.Page.Version.AuthorID
-
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-			kind, child.Page.ID, child.Page.Title, modified, created, editor)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+			entry.Page.ID, title, modified, created, editor)
 	}
 	w.Flush()
 
@@ -171,7 +169,7 @@ func (a *App) RunLs(spaceKey, target string, longFormat bool) error {
 	if parent != nil {
 		location = cache.PagePath(cs.Pages, parent.Page.ID)
 	}
-	fmt.Fprintf(os.Stderr, "\n%d items in %s\n", len(children), location)
+	fmt.Fprintf(os.Stderr, "\n%d items in %s\n", len(entries), location)
 	return nil
 }
 

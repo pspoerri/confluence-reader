@@ -97,6 +97,17 @@ type ChildPage struct {
 	Type          string `json:"type,omitempty"`
 }
 
+// Operation represents a permitted operation on a Confluence resource.
+type Operation struct {
+	Operation  string `json:"operation"`
+	TargetType string `json:"targetType"`
+}
+
+// PermittedOperationsResponse wraps the operations list returned by the API.
+type PermittedOperationsResponse struct {
+	Operations []Operation `json:"operations"`
+}
+
 // PaginatedResponse is the generic pagination wrapper from the API.
 type PaginatedResponse[T any] struct {
 	Results []T `json:"results"`

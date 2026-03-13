@@ -14,9 +14,11 @@ import (
 
 // CachedSpace stores space metadata and its page tree.
 type CachedSpace struct {
-	Space     api.Space  `json:"space"`
-	Pages     []api.Page `json:"pages"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	Space       api.Space                   `json:"space"`
+	Pages       []api.Page                  `json:"pages"`
+	Attachments map[string][]api.Attachment `json:"attachments"` // pageID -> attachments
+	Operations  []api.Operation             `json:"operations"`  // permitted space operations
+	UpdatedAt   time.Time                   `json:"updated_at"`
 }
 
 // PageNode is a tree node used for display and traversal.
@@ -89,10 +91,33 @@ func (s *Store) Refresh(client *api.Client, space api.Space) (*CachedSpace, erro
 		return nil, fmt.Errorf("fetch pages for space %s: %w", space.Key, err)
 	}
 
+	// Fetch attachment metadata for every page.
+	attachments := make(map[string][]api.Attachment, len(pages))
+	for i, p := range pages {
+		fmt.Fprintf(os.Stderr, "\rfetching attachments (%d/%d)...", i+1, len(pages))
+		atts, err := client.GetAttachmentsForPage(p.ID)
+		if err != nil {
+			return nil, fmt.Errorf("fetch attachments for page %s: %w", p.ID, err)
+		}
+		if len(atts) > 0 {
+			attachments[p.ID] = atts
+		}
+	}
+	fmt.Fprintln(os.Stderr)
+
+	// Fetch space-level permissions (one call per space).
+	fmt.Fprintf(os.Stderr, "fetching space permissions...\n")
+	operations, err := client.GetSpaceOperations(space.ID)
+	if err != nil {
+		return nil, fmt.Errorf("fetch space operations for %s: %w", space.Key, err)
+	}
+
 	cs := &CachedSpace{
-		Space:     space,
-		Pages:     pages,
-		UpdatedAt: time.Now(),
+		Space:       space,
+		Pages:       pages,
+		Attachments: attachments,
+		Operations:  operations,
+		UpdatedAt:   time.Now(),
 	}
 
 	if err := s.Save(cs); err != nil {

@@ -6,7 +6,7 @@ GOFLAGS :=
 export GOCACHE  ?= $(shell go env GOCACHE 2>/dev/null || echo /tmp/go-cache)
 export GOPATH   ?= $(shell go env GOPATH 2>/dev/null || echo /tmp/gopath)
 
-.PHONY: all build test test-v test-race vet fmt fmt-check clean install help
+.PHONY: all build test test-v test-race vet fmt fmt-check clean install install-skill help
 
 all: fmt-check vet test build ## Run checks, tests, and build (default)
 
@@ -39,6 +39,12 @@ INSTALL_DIR := $(HOME)/.local/bin
 install: build ## Install binary to ~/.local/bin
 	mkdir -p $(INSTALL_DIR)
 	cp $(BINARY) $(INSTALL_DIR)/$(BINARY)
+
+SKILL_DIR := $(HOME)/.config/opencode/skills/confluence-reader
+
+install-skill: install ## Install binary and OpenCode skill globally
+	mkdir -p $(SKILL_DIR)
+	cp .opencode/skills/confluence-reader/SKILL.md $(SKILL_DIR)/SKILL.md
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \

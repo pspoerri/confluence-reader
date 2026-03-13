@@ -203,3 +203,18 @@ func (c *Client) GetAttachmentsForPage(pageID string) ([]Attachment, error) {
 func (c *Client) DownloadAttachment(downloadPath string) (*http.Response, error) {
 	return c.doRaw("GET", downloadPath, nil)
 }
+
+// GetSpaceOperations returns the permitted operations for the current user on a space.
+func (c *Client) GetSpaceOperations(spaceID string) ([]Operation, error) {
+	path := fmt.Sprintf("/wiki/api/v2/spaces/%s/operations", spaceID)
+	data, err := c.do("GET", path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("fetch space operations: %w", err)
+	}
+
+	var resp PermittedOperationsResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("decode operations: %w", err)
+	}
+	return resp.Operations, nil
+}

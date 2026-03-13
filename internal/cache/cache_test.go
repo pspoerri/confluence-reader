@@ -7,8 +7,10 @@ import (
 )
 
 func TestBuildTree(t *testing.T) {
+	// Confluence v2 API: all pages have parentType="page". The homepage's
+	// parentId references an ID outside the fetched set, making it the root.
 	pages := []api.Page{
-		{ID: "1", Title: "Root", ParentID: "", ParentType: ""},
+		{ID: "1", Title: "Home", ParentID: "ext-space", ParentType: "page"},
 		{ID: "2", Title: "Child A", ParentID: "1", ParentType: "page"},
 		{ID: "3", Title: "Child B", ParentID: "1", ParentType: "page"},
 		{ID: "4", Title: "Grandchild", ParentID: "2", ParentType: "page"},
@@ -19,8 +21,8 @@ func TestBuildTree(t *testing.T) {
 	if len(roots) != 1 {
 		t.Fatalf("expected 1 root, got %d", len(roots))
 	}
-	if roots[0].Page.Title != "Root" {
-		t.Errorf("expected root title 'Root', got %q", roots[0].Page.Title)
+	if roots[0].Page.Title != "Home" {
+		t.Errorf("expected root title 'Home', got %q", roots[0].Page.Title)
 	}
 	if len(roots[0].Children) != 2 {
 		t.Fatalf("expected 2 children, got %d", len(roots[0].Children))
@@ -28,9 +30,10 @@ func TestBuildTree(t *testing.T) {
 }
 
 func TestBuildTree_MultipleRoots(t *testing.T) {
+	// Pages whose parentId is not in the set all become roots.
 	pages := []api.Page{
-		{ID: "1", Title: "Root A", ParentID: "", ParentType: ""},
-		{ID: "2", Title: "Root B", ParentID: "", ParentType: ""},
+		{ID: "1", Title: "Root A", ParentID: "ext-1", ParentType: "page"},
+		{ID: "2", Title: "Root B", ParentID: "ext-2", ParentType: "page"},
 	}
 
 	roots := BuildTree(pages)
@@ -90,13 +93,13 @@ func TestFindPages_NoMatch(t *testing.T) {
 
 func TestPagePath(t *testing.T) {
 	pages := []api.Page{
-		{ID: "1", Title: "Root", ParentID: "", ParentType: ""},
+		{ID: "1", Title: "Home", ParentID: "ext-space", ParentType: "page"},
 		{ID: "2", Title: "Section", ParentID: "1", ParentType: "page"},
 		{ID: "3", Title: "Page", ParentID: "2", ParentType: "page"},
 	}
 
 	path := PagePath(pages, "3")
-	expected := "/Root/Section/Page"
+	expected := "/Home/Section/Page"
 	if path != expected {
 		t.Errorf("expected %q, got %q", expected, path)
 	}
@@ -104,7 +107,7 @@ func TestPagePath(t *testing.T) {
 
 func TestPagePath_RootPage(t *testing.T) {
 	pages := []api.Page{
-		{ID: "1", Title: "Home", ParentID: "", ParentType: ""},
+		{ID: "1", Title: "Home", ParentID: "ext-space", ParentType: "page"},
 	}
 
 	path := PagePath(pages, "1")

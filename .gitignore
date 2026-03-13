@@ -1,0 +1,18 @@
+# Build output
+/confluence-reader
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# Config (contains secrets)
+config.json
+
+# Go
+/vendor/

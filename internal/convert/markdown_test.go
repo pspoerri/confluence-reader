@@ -141,6 +141,36 @@ func TestToMarkdown_TableNoHeader(t *testing.T) {
 	}
 }
 
+func TestToMarkdown_TableMixedThTd(t *testing.T) {
+	input := `<table><tr><th>H1</th><td>D1</td></tr><tr><td>A</td><td>B</td></tr></table>`
+	result := ToMarkdown(input, nil)
+
+	if !strings.Contains(result, "| H1 | D1 |") {
+		t.Errorf("expected mixed th/td row, got: %s", result)
+	}
+	if !strings.Contains(result, "| --- | --- |") {
+		t.Errorf("expected separator, got: %s", result)
+	}
+	if !strings.Contains(result, "| A | B |") {
+		t.Errorf("expected data row, got: %s", result)
+	}
+}
+
+func TestToMarkdown_TableWithTheadTbody(t *testing.T) {
+	input := `<table><thead><tr><th>Name</th><th>Value</th></tr></thead><tbody><tr><td>foo</td><td>bar</td></tr></tbody></table>`
+	result := ToMarkdown(input, nil)
+
+	if !strings.Contains(result, "| Name | Value |") {
+		t.Errorf("expected header row, got: %s", result)
+	}
+	if !strings.Contains(result, "| --- | --- |") {
+		t.Errorf("expected separator, got: %s", result)
+	}
+	if !strings.Contains(result, "| foo | bar |") {
+		t.Errorf("expected data row, got: %s", result)
+	}
+}
+
 func TestToMarkdown_CodeBlockWithLanguage(t *testing.T) {
 	input := `<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">python</ac:parameter><ac:plain-text-body><![CDATA[def hello():
     print("world")]]></ac:plain-text-body></ac:structured-macro>`

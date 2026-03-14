@@ -439,8 +439,7 @@ func convertLists(s string) string {
 func convertTables(s string) string {
 	tableRe := regexp.MustCompile(`(?s)<table[^>]*>(.*?)</table>`)
 	trRe := regexp.MustCompile(`(?s)<tr[^>]*>(.*?)</tr>`)
-	thRe := regexp.MustCompile(`(?s)<th[^>]*>(.*?)</th>`)
-	tdRe := regexp.MustCompile(`(?s)<td[^>]*>(.*?)</td>`)
+	cellRe := regexp.MustCompile(`(?s)<t[hd][^>]*>(.*?)</t[hd]>`)
 	tagRe := regexp.MustCompile(`<[^>]+>`)
 
 	return tableRe.ReplaceAllStringFunc(s, func(table string) string {
@@ -453,13 +452,6 @@ func convertTables(s string) string {
 		var lines []string
 		for i, row := range rows {
 			rowHTML := row[1]
-
-			// Detect if row contains <th> cells.
-			isHeader := thRe.MatchString(rowHTML)
-			cellRe := tdRe
-			if isHeader {
-				cellRe = thRe
-			}
 
 			cells := cellRe.FindAllStringSubmatch(rowHTML, -1)
 			var cols []string

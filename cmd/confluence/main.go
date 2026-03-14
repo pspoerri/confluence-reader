@@ -19,18 +19,20 @@ Options:
 Commands:
   configure                              Set up Confluence credentials
   spaces                                 List all accessible spaces
-  ls [-l] [-r] <space-key> [page-id|/path]
+  ls [-l] [-a] [-r] <space-key> [page-id|/path]
                                          List child pages (like unix ls)
   tree [-r] <space-key>                  List page tree in a space
   find [-r] <space-key> [query]          Find pages by title (or list all)
   read [-r] <space-key> <page-id|/path>  Read a page as markdown
   read-file [-r] <space-key> <page-id|/path> <filename>
                                          Download an attachment
-  mirror [-r] <space-key> <target-dir>   Mirror entire space to local directory
+  mirror [-a] [-r] <space-key> <target-dir>
+                                         Mirror entire space to local directory
   refresh <space-key>                    Refresh the local cache for a space
 
 Flags:
   -l, --long       Show detailed listing (ls only)
+  -a, --all        Include all attachments, not just those referenced in the page
   -r, --refresh    Force a cache refresh before running the command
 
 Configuration:
@@ -92,12 +94,15 @@ func main() {
 
 	case "ls":
 		longFormat := false
+		allFiles := false
 		refresh := false
 		lsArgs := args
 		for len(lsArgs) > 0 && strings.HasPrefix(lsArgs[0], "-") {
 			switch lsArgs[0] {
 			case "-l", "--long":
 				longFormat = true
+			case "-a", "--all":
+				allFiles = true
 			case "-r", "--refresh":
 				refresh = true
 			default:
@@ -106,13 +111,13 @@ func main() {
 			lsArgs = lsArgs[1:]
 		}
 		if len(lsArgs) < 1 {
-			die("usage: confluence-reader ls [-l] [-r] <space-key> [page-id|/path]")
+			die("usage: confluence-reader ls [-l] [-a] [-r] <space-key> [page-id|/path]")
 		}
 		target := ""
 		if len(lsArgs) >= 2 {
 			target = lsArgs[1]
 		}
-		err = app.RunLs(lsArgs[0], target, longFormat, refresh)
+		err = app.RunLs(lsArgs[0], target, longFormat, allFiles, refresh)
 
 	case "tree":
 		refresh, cmdArgs := parseRefreshFlag(args)
@@ -147,11 +152,24 @@ func main() {
 		err = app.RunReadFile(cmdArgs[0], cmdArgs[1], cmdArgs[2], refresh)
 
 	case "mirror":
-		refresh, cmdArgs := parseRefreshFlag(args)
-		if len(cmdArgs) < 2 {
-			die("usage: confluence-reader mirror [-r] <space-key> <target-dir>")
+		allFiles := false
+		refresh := false
+		mirrorArgs := args
+		for len(mirrorArgs) > 0 && strings.HasPrefix(mirrorArgs[0], "-") {
+			switch mirrorArgs[0] {
+			case "-a", "--all":
+				allFiles = true
+			case "-r", "--refresh":
+				refresh = true
+			default:
+				die("mirror: unknown flag: " + mirrorArgs[0])
+			}
+			mirrorArgs = mirrorArgs[1:]
 		}
-		err = app.RunMirror(cmdArgs[0], cmdArgs[1], refresh)
+		if len(mirrorArgs) < 2 {
+			die("usage: confluence-reader mirror [-a] [-r] <space-key> <target-dir>")
+		}
+		err = app.RunMirror(mirrorArgs[0], mirrorArgs[1], allFiles, refresh)
 
 	case "refresh":
 		if len(args) < 1 {

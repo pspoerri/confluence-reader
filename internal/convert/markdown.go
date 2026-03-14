@@ -156,6 +156,18 @@ func convertHTMLToMarkdown(s string) string {
 	return s
 }
 
+// ReferencedAttachments returns the set of attachment filenames that are
+// referenced in the Confluence storage-format HTML (via <ri:attachment>).
+func ReferencedAttachments(storageHTML string) map[string]bool {
+	re := regexp.MustCompile(`<ri:attachment\s+ri:filename="([^"]+)"`)
+	matches := re.FindAllStringSubmatch(storageHTML, -1)
+	result := make(map[string]bool, len(matches))
+	for _, m := range matches {
+		result[m[1]] = true
+	}
+	return result
+}
+
 func formatSize(bytes int64) string {
 	switch {
 	case bytes >= 1<<30:

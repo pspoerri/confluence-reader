@@ -107,7 +107,8 @@ type lsEntry struct {
 
 // RunLs lists pages like unix ls. Uses lazy caching: only fetches the
 // children and attachments of the viewed page, not the entire space.
-func (a *App) RunLs(spaceKey, target string, longFormat, refresh bool) error {
+// When allFiles is false, only attachments referenced in the page body are shown.
+func (a *App) RunLs(spaceKey, target string, longFormat, allFiles, refresh bool) error {
 	space, err := a.resolveSpace(spaceKey)
 	if err != nil {
 		return err
@@ -147,6 +148,15 @@ func (a *App) RunLs(spaceKey, target string, longFormat, refresh bool) error {
 		return err
 	}
 
+	// When filtering, fetch the page body to determine which attachments are referenced.
+	var referenced map[string]bool
+	if !allFiles && len(attachments) > 0 {
+		page, err := a.Client.GetPageByID(pageID)
+		if err == nil && page.Body != nil && page.Body.Storage != nil {
+			referenced = convert.ReferencedAttachments(page.Body.Storage.Value)
+		}
+	}
+
 	// Build entries.
 	var entries []lsEntry
 
@@ -170,6 +180,9 @@ func (a *App) RunLs(spaceKey, target string, longFormat, refresh bool) error {
 
 	// Attachments as files.
 	for _, att := range attachments {
+		if referenced != nil && !referenced[att.Title] {
+			continue
+		}
 		entries = append(entries, lsEntry{
 			Perms:    perms,
 			Name:     att.Title,
@@ -552,7 +565,8 @@ func (a *App) RunRefresh(spaceKey string) error {
 
 // RunMirror mirrors an entire Confluence space into a local directory.
 // Each page becomes a folder with an index.md file and its attachments.
-func (a *App) RunMirror(spaceKey, targetDir string, refresh bool) error {
+// When allFiles is false, only attachments referenced in the page body are downloaded.
+func (a *App) RunMirror(spaceKey, targetDir string, allFiles, refresh bool) error {
 	space, err := a.resolveSpace(spaceKey)
 	if err != nil {
 		return err
@@ -595,14 +609,14 @@ func (a *App) RunMirror(spaceKey, targetDir string, refresh bool) error {
 
 	// Download homepage content into the root directory.
 	if homepageNode != nil {
-		if err := a.downloadPage(cs, homepageNode.Page.ID, homepageNode.Page.Title, targetDir, bar); err != nil {
+		if err := a.downloadPage(cs, homepageNode.Page.ID, homepageNode.Page.Title, targetDir, allFiles, bar); err != nil {
 			return fmt.Errorf("download homepage: %w", err)
 		}
 	}
 
 	// Download all child pages recursively.
 	for _, node := range displayRoots {
-		if err := a.downloadTree(cs, node, targetDir, bar); err != nil {
+		if err := a.downloadTree(cs, node, targetDir, allFiles, bar); err != nil {
 			return err
 		}
 	}
@@ -618,7 +632,7 @@ func (a *App) RunMirror(spaceKey, targetDir string, refresh bool) error {
 }
 
 // downloadTree recursively downloads a page node and its children.
-func (a *App) downloadTree(cs *cache.CachedSpace, node *cache.PageNode, parentDir string, bar *progress.Bar) error {
+func (a *App) downloadTree(cs *cache.CachedSpace, node *cache.PageNode, parentDir string, allFiles bool, bar *progress.Bar) error {
 	dirName := sanitizeName(node.Page.Title)
 	dir := filepath.Join(parentDir, dirName)
 
@@ -626,12 +640,12 @@ func (a *App) downloadTree(cs *cache.CachedSpace, node *cache.PageNode, parentDi
 		return fmt.Errorf("create directory %s: %w", dir, err)
 	}
 
-	if err := a.downloadPage(cs, node.Page.ID, node.Page.Title, dir, bar); err != nil {
+	if err := a.downloadPage(cs, node.Page.ID, node.Page.Title, dir, allFiles, bar); err != nil {
 		return err
 	}
 
 	for _, child := range node.Children {
-		if err := a.downloadTree(cs, child, dir, bar); err != nil {
+		if err := a.downloadTree(cs, child, dir, allFiles, bar); err != nil {
 			return err
 		}
 	}
@@ -639,8 +653,9 @@ func (a *App) downloadTree(cs *cache.CachedSpace, node *cache.PageNode, parentDi
 }
 
 // downloadPage fetches a page, converts it to markdown, saves index.md,
-// and downloads all attachments (with renamed filenames) into the same directory.
-func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string, bar *progress.Bar) error {
+// and downloads attachments (with renamed filenames) into the same directory.
+// When allFiles is false, only attachments referenced in the page body are downloaded.
+func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string, allFiles bool, bar *progress.Bar) error {
 	page, err := a.Client.GetPageByID(pageID)
 	if err != nil {
 		return fmt.Errorf("fetch page %s: %w", pageID, err)
@@ -709,8 +724,21 @@ func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string,
 	}
 	bar.Increment()
 
+	// Determine which attachments to download.
+	downloadAtts := attachments
+	if !allFiles {
+		referenced := convert.ReferencedAttachments(body)
+		var filtered []api.Attachment
+		for _, att := range attachments {
+			if referenced[att.Title] {
+				filtered = append(filtered, att)
+			}
+		}
+		downloadAtts = filtered
+	}
+
 	// Download attachments into the same directory with renamed filenames.
-	for _, att := range attachments {
+	for _, att := range downloadAtts {
 		newName := renameMap[att.Title]
 		if err := a.downloadAttachment(cs, att, pageID, newName, dir); err != nil {
 			bar.Log("warning: %v", err)

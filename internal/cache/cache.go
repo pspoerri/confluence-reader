@@ -13,17 +13,26 @@ import (
 	"github.com/pspoerri/confluence-reader/internal/progress"
 )
 
+// RenameEntry records an attachment rename for the mirror command.
+type RenameEntry struct {
+	NewName   string `json:"new_name"`
+	FileID    string `json:"file_id"`
+	VersionNo int    `json:"version"`
+	FileSize  int64  `json:"file_size"`
+}
+
 // CachedSpace stores space metadata and its page tree.
 // Pages and Children are populated lazily: Pages holds the full page list
 // (set by EnsureFullTree or Refresh), while Children holds per-page child
 // lists fetched on demand. Attachments are always fetched lazily per page.
 type CachedSpace struct {
-	Space       api.Space                   `json:"space"`
-	Pages       []api.Page                  `json:"pages"`                 // full page list (populated by EnsureFullTree/Refresh)
-	Children    map[string][]api.ChildPage  `json:"children,omitempty"`    // lazy: pageID -> direct children
-	Attachments map[string][]api.Attachment `json:"attachments,omitempty"` // lazy: pageID -> attachments
-	Operations  []api.Operation             `json:"operations"`            // permitted space operations
-	UpdatedAt   time.Time                   `json:"updated_at"`
+	Space        api.Space                         `json:"space"`
+	Pages        []api.Page                        `json:"pages"`                   // full page list (populated by EnsureFullTree/Refresh)
+	Children     map[string][]api.ChildPage        `json:"children,omitempty"`      // lazy: pageID -> direct children
+	Attachments  map[string][]api.Attachment       `json:"attachments,omitempty"`   // lazy: pageID -> attachments
+	RenamedFiles map[string]map[string]RenameEntry `json:"renamed_files,omitempty"` // pageID -> originalName -> rename info
+	Operations   []api.Operation                   `json:"operations"`              // permitted space operations
+	UpdatedAt    time.Time                         `json:"updated_at"`
 }
 
 // PageNode is a tree node used for display and traversal.

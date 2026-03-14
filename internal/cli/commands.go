@@ -595,25 +595,30 @@ func (a *App) RunMirror(spaceKey, targetDir string, refresh bool) error {
 
 	// Download homepage content into the root directory.
 	if homepageNode != nil {
-		if err := a.downloadPage(homepageNode.Page.ID, targetDir, bar); err != nil {
+		if err := a.downloadPage(cs, homepageNode.Page.ID, homepageNode.Page.Title, targetDir, bar); err != nil {
 			return fmt.Errorf("download homepage: %w", err)
 		}
 	}
 
 	// Download all child pages recursively.
 	for _, node := range displayRoots {
-		if err := a.downloadTree(node, targetDir, bar); err != nil {
+		if err := a.downloadTree(cs, node, targetDir, bar); err != nil {
 			return err
 		}
 	}
 	bar.Finish()
+
+	// Persist the updated rename map.
+	if err := a.Cache.Save(cs); err != nil {
+		return fmt.Errorf("save cache: %w", err)
+	}
 
 	fmt.Fprintf(os.Stderr, "Mirrored space %s to %s (%d pages)\n", spaceKey, targetDir, total)
 	return nil
 }
 
 // downloadTree recursively downloads a page node and its children.
-func (a *App) downloadTree(node *cache.PageNode, parentDir string, bar *progress.Bar) error {
+func (a *App) downloadTree(cs *cache.CachedSpace, node *cache.PageNode, parentDir string, bar *progress.Bar) error {
 	dirName := sanitizeName(node.Page.Title)
 	dir := filepath.Join(parentDir, dirName)
 
@@ -621,12 +626,12 @@ func (a *App) downloadTree(node *cache.PageNode, parentDir string, bar *progress
 		return fmt.Errorf("create directory %s: %w", dir, err)
 	}
 
-	if err := a.downloadPage(node.Page.ID, dir, bar); err != nil {
+	if err := a.downloadPage(cs, node.Page.ID, node.Page.Title, dir, bar); err != nil {
 		return err
 	}
 
 	for _, child := range node.Children {
-		if err := a.downloadTree(child, dir, bar); err != nil {
+		if err := a.downloadTree(cs, child, dir, bar); err != nil {
 			return err
 		}
 	}
@@ -634,8 +639,8 @@ func (a *App) downloadTree(node *cache.PageNode, parentDir string, bar *progress
 }
 
 // downloadPage fetches a page, converts it to markdown, saves index.md,
-// and downloads all attachments into the same directory.
-func (a *App) downloadPage(pageID, dir string, bar *progress.Bar) error {
+// and downloads all attachments (with renamed filenames) into the same directory.
+func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string, bar *progress.Bar) error {
 	page, err := a.Client.GetPageByID(pageID)
 	if err != nil {
 		return fmt.Errorf("fetch page %s: %w", pageID, err)
@@ -646,6 +651,25 @@ func (a *App) downloadPage(pageID, dir string, bar *progress.Bar) error {
 		return fmt.Errorf("fetch attachments for page %s: %w", pageID, err)
 	}
 
+	// Build rename map: original filename → new filename.
+	renameMap := make(map[string]string, len(attachments))
+	if cs.RenamedFiles == nil {
+		cs.RenamedFiles = make(map[string]map[string]cache.RenameEntry)
+	}
+	if cs.RenamedFiles[pageID] == nil {
+		cs.RenamedFiles[pageID] = make(map[string]cache.RenameEntry)
+	}
+	for _, att := range attachments {
+		newName := convert.RenameAttachment(pageTitle, att.Title, att.ID)
+		renameMap[att.Title] = newName
+		cs.RenamedFiles[pageID][att.Title] = cache.RenameEntry{
+			NewName:   newName,
+			FileID:    att.FileID,
+			VersionNo: att.Version.Number,
+			FileSize:  att.FileSize,
+		}
+	}
+
 	// Convert to markdown.
 	var body string
 	if page.Body != nil && page.Body.Storage != nil {
@@ -653,7 +677,11 @@ func (a *App) downloadPage(pageID, dir string, bar *progress.Bar) error {
 	}
 	md := convert.ToMarkdown(body, attachments)
 
-	// Rewrite attachment:filename references to local filenames.
+	// Rewrite attachment:filename references to renamed local filenames.
+	for origName, newName := range renameMap {
+		md = strings.ReplaceAll(md, "(attachment:"+origName+")", "("+newName+")")
+	}
+	// Catch any remaining attachment: references (shouldn't happen, but safety).
 	md = strings.ReplaceAll(md, "(attachment:", "(")
 
 	var meta strings.Builder
@@ -681,9 +709,10 @@ func (a *App) downloadPage(pageID, dir string, bar *progress.Bar) error {
 	}
 	bar.Increment()
 
-	// Download attachments into the same directory.
+	// Download attachments into the same directory with renamed filenames.
 	for _, att := range attachments {
-		if err := a.downloadAttachment(att, dir); err != nil {
+		newName := renameMap[att.Title]
+		if err := a.downloadAttachment(cs, att, pageID, newName, dir); err != nil {
 			bar.Log("warning: %v", err)
 		}
 	}
@@ -691,8 +720,21 @@ func (a *App) downloadPage(pageID, dir string, bar *progress.Bar) error {
 	return nil
 }
 
-// downloadAttachment downloads a single attachment into dir.
-func (a *App) downloadAttachment(att api.Attachment, dir string) error {
+// downloadAttachment downloads a single attachment into dir using the
+// given filename. Skips the download if the file already exists on disk
+// with matching size from a previous mirror run.
+func (a *App) downloadAttachment(cs *cache.CachedSpace, att api.Attachment, pageID, filename, dir string) error {
+	outPath := filepath.Join(dir, sanitizeFilename(filename))
+
+	// Skip download if file exists and matches cached metadata.
+	if info, err := os.Stat(outPath); err == nil {
+		if cached, ok := cs.RenamedFiles[pageID][att.Title]; ok {
+			if cached.VersionNo == att.Version.Number && info.Size() == cached.FileSize {
+				return nil // already up to date
+			}
+		}
+	}
+
 	downloadPath := att.Links.Download
 	if downloadPath == "" {
 		downloadPath = att.DownloadLink
@@ -707,7 +749,6 @@ func (a *App) downloadAttachment(att api.Attachment, dir string) error {
 	}
 	defer resp.Body.Close()
 
-	outPath := filepath.Join(dir, sanitizeFilename(att.Title))
 	f, err := os.Create(outPath)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", outPath, err)

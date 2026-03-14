@@ -123,10 +123,130 @@ func convertHTMLToMarkdown(s string) string {
 		return placeholder(idx)
 	})
 
+	// Confluence noformat macro — like code blocks but without language.
+	noformatRe := regexp.MustCompile(`(?s)<ac:structured-macro[^>]*ac:name="noformat"[^>]*>.*?<ac:plain-text-body>\s*<!\[CDATA\[(.*?)\]\]>\s*</ac:plain-text-body>.*?</ac:structured-macro>`)
+	s = noformatRe.ReplaceAllStringFunc(s, func(match string) string {
+		m := noformatRe.FindStringSubmatch(match)
+		code := ""
+		if len(m) >= 2 {
+			code = m[1]
+		}
+		block := "\n```\n" + code + "\n```\n"
+		idx := len(codeBlocks)
+		codeBlocks = append(codeBlocks, block)
+		return placeholder(idx)
+	})
+
 	// Confluence info/warning/note/tip/success/error/decision panels.
 	// Convert to markdown blockquotes with a label prefix.
 	// The inner content (ac:rich-text-body) is kept as HTML so subsequent
 	// conversion steps can process it normally.
+	// Confluence generic "panel" macro (with optional title).
+	panelMacroRe := regexp.MustCompile(`(?s)<ac:structured-macro[^>]*ac:name="panel"[^>]*>(?:.*?<ac:parameter\s+ac:name="title"[^>]*>(.*?)</ac:parameter>)?.*?<ac:rich-text-body>(.*?)</ac:rich-text-body>\s*</ac:structured-macro>`)
+	s = panelMacroRe.ReplaceAllStringFunc(s, func(match string) string {
+		sub := panelMacroRe.FindStringSubmatch(match)
+		title := ""
+		if len(sub) >= 2 {
+			title = strings.TrimSpace(sub[1])
+		}
+		body := ""
+		if len(sub) >= 3 {
+			body = sub[2]
+		}
+		if title != "" {
+			return fmt.Sprintf("\n> **%s:**\n> %s\n", title, body)
+		}
+		return fmt.Sprintf("\n> %s\n", body)
+	})
+
+	// Confluence excerpt macro — render the body inline.
+	excerptRe := regexp.MustCompile(`(?s)<ac:structured-macro[^>]*ac:name="excerpt"[^>]*>.*?<ac:rich-text-body>(.*?)</ac:rich-text-body>\s*</ac:structured-macro>`)
+	s = excerptRe.ReplaceAllString(s, "$1")
+
+	// Confluence status lozenge macro.
+	statusRe := regexp.MustCompile(`(?s)<ac:structured-macro[^>]*ac:name="status"[^>]*>.*?<ac:parameter\s+ac:name="title"[^>]*>(.*?)</ac:parameter>.*?</ac:structured-macro>`)
+	s = statusRe.ReplaceAllString(s, " `$1` ")
+
+	// Confluence date macro.
+	dateRe := regexp.MustCompile(`(?s)<ac:structured-macro[^>]*ac:name="date"[^>]*>.*?<ac:parameter\s+ac:name="date"[^>]*>(.*?)</ac:parameter>.*?</ac:structured-macro>`)
+	s = dateRe.ReplaceAllString(s, "$1")
+
+	// Confluence anchor macro — drop silently (anchors have no visual representation).
+	anchorRe := regexp.MustCompile(`(?s)<ac:structured-macro[^>]*ac:name="anchor"[^>]*>.*?</ac:structured-macro>`)
+	s = anchorRe.ReplaceAllString(s, "")
+
+	// Confluence TOC macro — drop (not useful in exported markdown).
+	tocRe := regexp.MustCompile(`(?s)<ac:structured-macro[^>]*ac:name="toc"[^>]*>.*?</ac:structured-macro>`)
+	s = tocRe.ReplaceAllString(s, "")
+	// Self-closing TOC variant.
+	tocSelfRe := regexp.MustCompile(`<ac:structured-macro[^>]*ac:name="toc"[^/]*/\s*>`)
+	s = tocSelfRe.ReplaceAllString(s, "")
+
+	// Confluence JIRA issue macro — render as link text.
+	jiraRe := regexp.MustCompile(`(?s)<ac:structured-macro[^>]*ac:name="jira"[^>]*>.*?<ac:parameter\s+ac:name="key"[^>]*>(.*?)</ac:parameter>.*?</ac:structured-macro>`)
+	s = jiraRe.ReplaceAllString(s, "`$1`")
+
+	// Confluence task lists.
+	taskListRe := regexp.MustCompile(`(?s)<ac:task-list>(.*?)</ac:task-list>`)
+	taskRe := regexp.MustCompile(`(?s)<ac:task>(.*?)</ac:task>`)
+	taskStatusRe := regexp.MustCompile(`(?s)<ac:task-status>(.*?)</ac:task-status>`)
+	taskBodyRe := regexp.MustCompile(`(?s)<ac:task-body>(.*?)</ac:task-body>`)
+	s = taskListRe.ReplaceAllStringFunc(s, func(match string) string {
+		inner := taskListRe.FindStringSubmatch(match)[1]
+		return taskRe.ReplaceAllStringFunc(inner, func(taskMatch string) string {
+			task := taskRe.FindStringSubmatch(taskMatch)[1]
+			status := ""
+			if m := taskStatusRe.FindStringSubmatch(task); len(m) >= 2 {
+				status = strings.TrimSpace(m[1])
+			}
+			body := ""
+			if m := taskBodyRe.FindStringSubmatch(task); len(m) >= 2 {
+				body = strings.TrimSpace(m[1])
+			}
+			checkbox := "- [ ] "
+			if status == "complete" {
+				checkbox = "- [x] "
+			}
+			return checkbox + body + "\n"
+		})
+	})
+
+	// User mentions — extract the display text or fall back to "user".
+	mentionRe := regexp.MustCompile(`(?s)<ac:link[^>]*>.*?<ri:user\s[^>]*/>.*?<ac:plain-text-link-body>\s*<!\[CDATA\[(.*?)\]\]>\s*</ac:plain-text-link-body>.*?</ac:link>`)
+	s = mentionRe.ReplaceAllString(s, "@$1")
+	// User mentions without a link body — just mark as mention.
+	mentionNoBodyRe := regexp.MustCompile(`(?s)<ac:link[^>]*>.*?<ri:user\s[^>]*/>.*?</ac:link>`)
+	s = mentionNoBodyRe.ReplaceAllString(s, "@user")
+
+	// Confluence page links — <ac:link> with <ri:page>.
+	pageLinkWithBodyRe := regexp.MustCompile(`(?s)<ac:link[^>]*>.*?<ri:page\s+ri:content-title="([^"]+)"[^/]*/?>.*?<ac:plain-text-link-body>\s*<!\[CDATA\[(.*?)\]\]>\s*</ac:plain-text-link-body>.*?</ac:link>`)
+	s = pageLinkWithBodyRe.ReplaceAllString(s, "[$2](page:$1)")
+	pageLinkRe := regexp.MustCompile(`(?s)<ac:link[^>]*>.*?<ri:page\s+ri:content-title="([^"]+)"[^/]*/?>.*?</ac:link>`)
+	s = pageLinkRe.ReplaceAllString(s, "[$1](page:$1)")
+
+	// Confluence emoticons.
+	emoticonRe := regexp.MustCompile(`<ac:emoticon\s+ac:name="([^"]+)"[^/]*/?>`)
+	emoticonMap := map[string]string{
+		"smile": "(smile)", "sad": "(sad)", "cheeky": "(cheeky)",
+		"laugh": "(laugh)", "wink": "(wink)", "thumbs-up": "(thumbs-up)",
+		"thumbs-down": "(thumbs-down)", "information": "(i)",
+		"tick": "(check)", "cross": "(x)", "warning": "(warning)",
+		"plus": "(+)", "minus": "(-)", "question": "(?)",
+		"light-on": "(idea)", "light-off": "(off)", "yellow-star": "(star)",
+		"red-star": "(star)", "green-star": "(star)", "blue-star": "(star)",
+		"heart": "(heart)", "broken-heart": "(broken-heart)",
+	}
+	s = emoticonRe.ReplaceAllStringFunc(s, func(match string) string {
+		m := emoticonRe.FindStringSubmatch(match)
+		if len(m) >= 2 {
+			if text, ok := emoticonMap[m[1]]; ok {
+				return text
+			}
+			return "(" + m[1] + ")"
+		}
+		return match
+	})
+
 	panelNames := map[string]string{
 		"info":     "Info",
 		"note":     "Note",
@@ -178,26 +298,40 @@ func convertHTMLToMarkdown(s string) string {
 	s = regexp.MustCompile(`<i\b[^>]*>`).ReplaceAllString(s, "*")
 	s = strings.ReplaceAll(s, "</i>", "*")
 
+	// Strikethrough.
+	s = regexp.MustCompile(`<del\b[^>]*>`).ReplaceAllString(s, "~~")
+	s = strings.ReplaceAll(s, "</del>", "~~")
+	s = regexp.MustCompile(`<s\b[^>]*>`).ReplaceAllString(s, "~~")
+	s = strings.ReplaceAll(s, "</s>", "~~")
+	s = regexp.MustCompile(`<strike\b[^>]*>`).ReplaceAllString(s, "~~")
+	s = strings.ReplaceAll(s, "</strike>", "~~")
+
+	// Underline — no markdown equivalent, render as emphasis.
+	s = regexp.MustCompile(`<u\b[^>]*>`).ReplaceAllString(s, "*")
+	s = strings.ReplaceAll(s, "</u>", "*")
+
+	// Superscript / subscript.
+	s = regexp.MustCompile(`<sup\b[^>]*>`).ReplaceAllString(s, "^(")
+	s = strings.ReplaceAll(s, "</sup>", ")")
+	s = regexp.MustCompile(`<sub\b[^>]*>`).ReplaceAllString(s, "~(")
+	s = strings.ReplaceAll(s, "</sub>", ")")
+
 	// Links.
 	s = regexp.MustCompile(`<a[^>]+href="([^"]*)"[^>]*>(.*?)</a>`).ReplaceAllString(s, "[$2]($1)")
 
-	// Ordered list items: replace <li> inside <ol> with numbered markers.
-	olRe := regexp.MustCompile(`(?s)<ol[^>]*>(.*?)</ol>`)
-	s = olRe.ReplaceAllStringFunc(s, func(match string) string {
-		inner := olRe.FindStringSubmatch(match)[1]
-		n := 0
-		liRe := regexp.MustCompile(`<li[^>]*>`)
-		inner = liRe.ReplaceAllStringFunc(inner, func(string) string {
-			n++
-			return fmt.Sprintf("%d. ", n)
-		})
-		return inner
-	})
-	s = regexp.MustCompile(`</?ol[^>]*>`).ReplaceAllString(s, "")
+	// Lists — handle nesting by converting from inside-out.
+	s = convertLists(s)
 
-	// Unordered list items.
-	s = regexp.MustCompile(`<li[^>]*>`).ReplaceAllString(s, "- ")
-	s = strings.ReplaceAll(s, "</li>", "\n")
+	// Blockquotes.
+	s = regexp.MustCompile(`<blockquote\b[^>]*>`).ReplaceAllString(s, "\n> ")
+	s = strings.ReplaceAll(s, "</blockquote>", "\n")
+
+	// Definition lists.
+	s = regexp.MustCompile(`</?dl[^>]*>`).ReplaceAllString(s, "\n")
+	s = regexp.MustCompile(`<dt[^>]*>`).ReplaceAllString(s, "**")
+	s = strings.ReplaceAll(s, "</dt>", "**\n")
+	s = regexp.MustCompile(`<dd[^>]*>`).ReplaceAllString(s, ": ")
+	s = strings.ReplaceAll(s, "</dd>", "\n")
 
 	// Paragraphs and line breaks.
 	s = regexp.MustCompile(`<p[^>]*>`).ReplaceAllString(s, "")
@@ -223,6 +357,80 @@ func convertHTMLToMarkdown(s string) string {
 
 	// Collapse excessive newlines.
 	s = regexp.MustCompile(`\n{3,}`).ReplaceAllString(s, "\n\n")
+
+	return s
+}
+
+// convertLists converts HTML ordered and unordered lists to markdown,
+// handling nesting by processing innermost lists first.
+func convertLists(s string) string {
+	liRe := regexp.MustCompile(`<li[^>]*>`)
+	closeLiRe := regexp.MustCompile(`</li>`)
+
+	// Process lists from innermost to outermost. An innermost list is one
+	// whose content between <ol>...</ol> or <ul>...</ul> contains no
+	// further list tags. We find them by locating closing tags and
+	// scanning backwards for the nearest matching open tag.
+	for {
+		changed := false
+
+		// Find innermost list by looking for </ol> or </ul> and finding
+		// the nearest corresponding open tag that has no nested lists.
+		for _, listTag := range []string{"ol", "ul"} {
+			closeTag := "</" + listTag + ">"
+			closeIdx := strings.Index(s, closeTag)
+			if closeIdx == -1 {
+				continue
+			}
+			// Find the last opening tag before this close tag.
+			openRe := regexp.MustCompile(`<` + listTag + `[^>]*>`)
+			segment := s[:closeIdx]
+			locs := openRe.FindAllStringIndex(segment, -1)
+			if locs == nil {
+				continue
+			}
+			openLoc := locs[len(locs)-1]
+			inner := s[openLoc[1]:closeIdx]
+
+			// Convert the inner list items.
+			var converted string
+			if listTag == "ol" {
+				n := 0
+				converted = liRe.ReplaceAllStringFunc(inner, func(string) string {
+					n++
+					return fmt.Sprintf("%d. ", n)
+				})
+			} else {
+				converted = liRe.ReplaceAllString(inner, "- ")
+			}
+			converted = closeLiRe.ReplaceAllString(converted, "\n")
+
+			// Indent this converted block if it's nested inside another list item.
+			// Check if there's an unclosed <li> before our open tag.
+			before := s[:openLoc[0]]
+			openLis := strings.Count(before, "<li") - strings.Count(before, "</li>")
+			if openLis > 0 {
+				lines := strings.Split(converted, "\n")
+				for i, line := range lines {
+					if strings.TrimSpace(line) != "" {
+						lines[i] = "  " + line
+					}
+				}
+				converted = strings.Join(lines, "\n")
+			}
+
+			s = s[:openLoc[0]] + converted + s[closeIdx+len(closeTag):]
+			changed = true
+			break // restart from the beginning
+		}
+
+		if !changed {
+			break
+		}
+	}
+
+	// Clean up any remaining list wrapper tags.
+	s = regexp.MustCompile(`</?[ou]l[^>]*>`).ReplaceAllString(s, "")
 
 	return s
 }

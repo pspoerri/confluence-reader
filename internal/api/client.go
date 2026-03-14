@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -72,7 +73,16 @@ func (c *Client) do(method, path string, query url.Values) ([]byte, error) {
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("api error (status %d): %s", resp.StatusCode, string(body))
+		msg := strings.TrimSpace(string(body))
+		if strings.HasPrefix(msg, "<") || strings.Contains(msg, "<!DOCTYPE") {
+			msg = http.StatusText(resp.StatusCode)
+			if msg == "" {
+				msg = "unknown error"
+			}
+		} else if len(msg) > 200 {
+			msg = msg[:200] + "..."
+		}
+		return nil, fmt.Errorf("api error (status %d): %s", resp.StatusCode, msg)
 	}
 
 	c.logf("body: %d bytes", len(body))
@@ -110,7 +120,18 @@ func (c *Client) doRaw(method, path string, query url.Values) (*http.Response, e
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		return nil, fmt.Errorf("api error (status %d): %s", resp.StatusCode, string(body))
+		msg := strings.TrimSpace(string(body))
+		// If the response is HTML (e.g. a JIRA/Confluence 404 page), replace
+		// the verbose markup with a short status description.
+		if strings.HasPrefix(msg, "<") || strings.Contains(msg, "<!DOCTYPE") {
+			msg = http.StatusText(resp.StatusCode)
+			if msg == "" {
+				msg = "unknown error"
+			}
+		} else if len(msg) > 200 {
+			msg = msg[:200] + "..."
+		}
+		return nil, fmt.Errorf("api error (status %d): %s", resp.StatusCode, msg)
 	}
 
 	return resp, nil
@@ -201,6 +222,15 @@ func (c *Client) GetAttachmentsForPage(pageID string) ([]Attachment, error) {
 // DownloadAttachment downloads an attachment and returns the response.
 // The caller must close the response body.
 func (c *Client) DownloadAttachment(downloadPath string) (*http.Response, error) {
+	// The download link may be an absolute URL or a relative path.
+	// Strip the base URL prefix so doRaw can reconstruct it cleanly.
+	downloadPath = strings.TrimPrefix(downloadPath, c.BaseURL)
+
+	// Confluence Cloud serves content under /wiki; ensure the path
+	// includes this prefix so the request is routed correctly.
+	if !strings.HasPrefix(downloadPath, "/wiki/") {
+		downloadPath = "/wiki" + downloadPath
+	}
 	return c.doRaw("GET", downloadPath, nil)
 }
 

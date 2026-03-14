@@ -103,6 +103,107 @@ func TestToMarkdown_HTMLEntities(t *testing.T) {
 	}
 }
 
+func TestToMarkdown_NamedHTMLEntities(t *testing.T) {
+	input := `<h3>Suggested &ldquo;bridging&rdquo; model &mdash; hybrid stage-gate &amp; agile</h3>`
+	result := ToMarkdown(input, nil)
+
+	expected := `### Suggested \x{201c}bridging\x{201d} model \x{2014} hybrid stage-gate & agile`
+	if !strings.Contains(result, "Suggested \u201cbridging\u201d model \u2014 hybrid stage-gate & agile") {
+		t.Errorf("expected named entity decoding, got: %s (expected %s)", result, expected)
+	}
+}
+
+func TestToMarkdown_Table(t *testing.T) {
+	input := `<table><tr><th>Name</th><th>Value</th></tr><tr><td>foo</td><td>bar</td></tr><tr><td>baz</td><td>qux</td></tr></table>`
+	result := ToMarkdown(input, nil)
+
+	if !strings.Contains(result, "| Name | Value |") {
+		t.Errorf("expected header row, got: %s", result)
+	}
+	if !strings.Contains(result, "| --- | --- |") {
+		t.Errorf("expected separator row, got: %s", result)
+	}
+	if !strings.Contains(result, "| foo | bar |") {
+		t.Errorf("expected data row, got: %s", result)
+	}
+}
+
+func TestToMarkdown_TableNoHeader(t *testing.T) {
+	input := `<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>`
+	result := ToMarkdown(input, nil)
+
+	if !strings.Contains(result, "| a | b |") {
+		t.Errorf("expected first row, got: %s", result)
+	}
+	if !strings.Contains(result, "| --- | --- |") {
+		t.Errorf("expected separator after first row, got: %s", result)
+	}
+}
+
+func TestToMarkdown_CodeBlockWithLanguage(t *testing.T) {
+	input := `<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">python</ac:parameter><ac:plain-text-body><![CDATA[def hello():
+    print("world")]]></ac:plain-text-body></ac:structured-macro>`
+	result := ToMarkdown(input, nil)
+
+	if !strings.Contains(result, "```python") {
+		t.Errorf("expected language in code fence, got: %s", result)
+	}
+	if !strings.Contains(result, `print("world")`) {
+		t.Errorf("expected code content, got: %s", result)
+	}
+}
+
+func TestToMarkdown_CodeBlockPreservesEntities(t *testing.T) {
+	input := `<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[if (a < b && c > d) {
+    x &= y;
+}]]></ac:plain-text-body></ac:structured-macro>`
+	result := ToMarkdown(input, nil)
+
+	if !strings.Contains(result, "a < b && c > d") {
+		t.Errorf("expected raw operators preserved in code block, got: %s", result)
+	}
+}
+
+func TestToMarkdown_InlineCodePreservesContent(t *testing.T) {
+	input := `<p>Use <code>&lt;div&gt;</code> for containers</p>`
+	result := ToMarkdown(input, nil)
+
+	if !strings.Contains(result, "`<div>`") {
+		t.Errorf("expected decoded entities in inline code, got: %s", result)
+	}
+}
+
+func TestToMarkdown_PreBlock(t *testing.T) {
+	input := `<pre>line 1
+line 2</pre>`
+	result := ToMarkdown(input, nil)
+
+	if !strings.Contains(result, "```\nline 1\nline 2\n```") {
+		t.Errorf("expected pre block conversion, got: %s", result)
+	}
+}
+
+func TestToMarkdown_InfoPanel(t *testing.T) {
+	input := `<ac:structured-macro ac:name="info"><ac:rich-text-body><p>This is important information.</p></ac:rich-text-body></ac:structured-macro>`
+	result := ToMarkdown(input, nil)
+
+	if !strings.Contains(result, "> **Info:**") {
+		t.Errorf("expected info callout, got: %s", result)
+	}
+	if !strings.Contains(result, "This is important information.") {
+		t.Errorf("expected info content, got: %s", result)
+	}
+}
+
+func TestToMarkdown_WarningPanel(t *testing.T) {
+	input := `<ac:structured-macro ac:name="warning"><ac:rich-text-body><p>Be careful!</p></ac:rich-text-body></ac:structured-macro>`
+	result := ToMarkdown(input, nil)
+
+	if !strings.Contains(result, "> **Warning:**") {
+		t.Errorf("expected warning callout, got: %s", result)
+	}
+}
+
 func TestToMarkdown_EmptyBody(t *testing.T) {
 	result := ToMarkdown("", nil)
 	if result != "" {

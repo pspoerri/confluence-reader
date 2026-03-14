@@ -115,3 +115,25 @@ func TestPagePath_RootPage(t *testing.T) {
 		t.Errorf("expected /Home, got %q", path)
 	}
 }
+
+func TestCountNodes(t *testing.T) {
+	pages := []api.Page{
+		{ID: "1", Title: "Home", ParentID: "ext-space", ParentType: "page"},
+		{ID: "2", Title: "Child A", ParentID: "1", ParentType: "page"},
+		{ID: "3", Title: "Child B", ParentID: "1", ParentType: "page"},
+		{ID: "4", Title: "Grandchild", ParentID: "2", ParentType: "page"},
+	}
+
+	roots := BuildTree(pages)
+	count := CountNodes(roots)
+	if count != 4 {
+		t.Errorf("expected 4 nodes, got %d", count)
+	}
+}
+
+func TestCountNodes_Empty(t *testing.T) {
+	count := CountNodes(nil)
+	if count != 0 {
+		t.Errorf("expected 0 for nil roots, got %d", count)
+	}
+}

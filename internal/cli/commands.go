@@ -15,6 +15,7 @@ import (
 	"github.com/pspoerri/confluence-reader/internal/cache"
 	"github.com/pspoerri/confluence-reader/internal/config"
 	"github.com/pspoerri/confluence-reader/internal/convert"
+	"github.com/pspoerri/confluence-reader/internal/progress"
 )
 
 // App holds the shared state for all CLI commands.
@@ -595,6 +596,13 @@ func (a *App) RunMirror(spaceKey, targetDir string) error {
 		}
 	}
 
+	// Count total pages for the progress bar.
+	total := cache.CountNodes(displayRoots)
+	if homepageNode != nil {
+		total++
+	}
+	bar := progress.New("Mirroring pages", total)
+
 	// Create target directory.
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		return fmt.Errorf("create target directory: %w", err)
@@ -602,24 +610,25 @@ func (a *App) RunMirror(spaceKey, targetDir string) error {
 
 	// Download homepage content into the root directory.
 	if homepageNode != nil {
-		if err := a.downloadPage(homepageNode.Page.ID, targetDir); err != nil {
+		if err := a.downloadPage(homepageNode.Page.ID, targetDir, bar); err != nil {
 			return fmt.Errorf("download homepage: %w", err)
 		}
 	}
 
 	// Download all child pages recursively.
 	for _, node := range displayRoots {
-		if err := a.downloadTree(node, targetDir); err != nil {
+		if err := a.downloadTree(node, targetDir, bar); err != nil {
 			return err
 		}
 	}
+	bar.Finish()
 
-	fmt.Fprintf(os.Stderr, "\nMirrored space %s to %s\n", spaceKey, targetDir)
+	fmt.Fprintf(os.Stderr, "Mirrored space %s to %s (%d pages)\n", spaceKey, targetDir, total)
 	return nil
 }
 
 // downloadTree recursively downloads a page node and its children.
-func (a *App) downloadTree(node *cache.PageNode, parentDir string) error {
+func (a *App) downloadTree(node *cache.PageNode, parentDir string, bar *progress.Bar) error {
 	dirName := sanitizeName(node.Page.Title)
 	dir := filepath.Join(parentDir, dirName)
 
@@ -627,12 +636,12 @@ func (a *App) downloadTree(node *cache.PageNode, parentDir string) error {
 		return fmt.Errorf("create directory %s: %w", dir, err)
 	}
 
-	if err := a.downloadPage(node.Page.ID, dir); err != nil {
+	if err := a.downloadPage(node.Page.ID, dir, bar); err != nil {
 		return err
 	}
 
 	for _, child := range node.Children {
-		if err := a.downloadTree(child, dir); err != nil {
+		if err := a.downloadTree(child, dir, bar); err != nil {
 			return err
 		}
 	}
@@ -641,7 +650,7 @@ func (a *App) downloadTree(node *cache.PageNode, parentDir string) error {
 
 // downloadPage fetches a page, converts it to markdown, saves index.md,
 // and downloads all attachments into the same directory.
-func (a *App) downloadPage(pageID, dir string) error {
+func (a *App) downloadPage(pageID, dir string, bar *progress.Bar) error {
 	page, err := a.Client.GetPageByID(pageID)
 	if err != nil {
 		return fmt.Errorf("fetch page %s: %w", pageID, err)
@@ -685,12 +694,12 @@ func (a *App) downloadPage(pageID, dir string) error {
 	if err := os.WriteFile(indexPath, []byte(content), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", indexPath, err)
 	}
-	fmt.Fprintf(os.Stderr, "  %s\n", indexPath)
+	bar.Increment()
 
 	// Download attachments into the same directory.
 	for _, att := range attachments {
 		if err := a.downloadAttachment(att, dir); err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: %v\n", err)
+			bar.Log("warning: %v", err)
 		}
 	}
 
@@ -720,12 +729,10 @@ func (a *App) downloadAttachment(att api.Attachment, dir string) error {
 	}
 	defer f.Close()
 
-	n, err := io.Copy(f, resp.Body)
-	if err != nil {
+	if _, err := io.Copy(f, resp.Body); err != nil {
 		return fmt.Errorf("write %s: %w", outPath, err)
 	}
 
-	fmt.Fprintf(os.Stderr, "  %s (%d bytes)\n", outPath, n)
 	return nil
 }
 

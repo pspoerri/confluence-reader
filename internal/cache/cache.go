@@ -10,6 +10,7 @@ import (
 
 	"github.com/pspoerri/confluence-reader/internal/api"
 	"github.com/pspoerri/confluence-reader/internal/config"
+	"github.com/pspoerri/confluence-reader/internal/progress"
 )
 
 // CachedSpace stores space metadata and its page tree.
@@ -93,8 +94,8 @@ func (s *Store) Refresh(client *api.Client, space api.Space) (*CachedSpace, erro
 
 	// Fetch attachment metadata for every page.
 	attachments := make(map[string][]api.Attachment, len(pages))
-	for i, p := range pages {
-		fmt.Fprintf(os.Stderr, "\rfetching attachments (%d/%d)...", i+1, len(pages))
+	bar := progress.New("Fetching attachments", len(pages))
+	for _, p := range pages {
 		atts, err := client.GetAttachmentsForPage(p.ID)
 		if err != nil {
 			return nil, fmt.Errorf("fetch attachments for page %s: %w", p.ID, err)
@@ -102,11 +103,12 @@ func (s *Store) Refresh(client *api.Client, space api.Space) (*CachedSpace, erro
 		if len(atts) > 0 {
 			attachments[p.ID] = atts
 		}
+		bar.Increment()
 	}
-	fmt.Fprintln(os.Stderr)
+	bar.Finish()
 
 	// Fetch space-level permissions (one call per space).
-	fmt.Fprintf(os.Stderr, "fetching space permissions...\n")
+	fmt.Fprintf(os.Stderr, "Fetching space permissions...\n")
 	operations, err := client.GetSpaceOperations(space.ID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch space operations for %s: %w", space.Key, err)
@@ -255,4 +257,21 @@ func PagePath(pages []api.Page, pageID string) string {
 		current = p.ParentID
 	}
 	return "/" + strings.Join(parts, "/")
+}
+
+// CountNodes returns the total number of nodes in the given trees.
+func CountNodes(roots []*PageNode) int {
+	n := 0
+	for _, r := range roots {
+		n += countSubtree(r)
+	}
+	return n
+}
+
+func countSubtree(node *PageNode) int {
+	n := 1
+	for _, c := range node.Children {
+		n += countSubtree(c)
+	}
+	return n
 }

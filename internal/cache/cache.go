@@ -237,8 +237,13 @@ func PagePath(pages []api.Page, pageID string) string {
 	}
 
 	var parts []string
+	visited := make(map[string]bool)
 	current := pageID
 	for current != "" {
+		if visited[current] {
+			break
+		}
+		visited[current] = true
 		p, ok := index[current]
 		if !ok {
 			break

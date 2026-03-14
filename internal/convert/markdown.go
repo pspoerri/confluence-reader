@@ -42,7 +42,8 @@ func ToMarkdown(storageHTML string, attachments []api.Attachment) string {
 // replaceACImages converts <ac:image> tags to markdown image syntax.
 func replaceACImages(s string, attachments map[string]api.Attachment) string {
 	// Match <ac:image ...><ri:attachment ri:filename="..." />...</ac:image>
-	re := regexp.MustCompile(`<ac:image[^>]*>.*?<ri:attachment\s+ri:filename="([^"]+)"\s*/?>.*?</ac:image>`)
+	// (?s) enables dotall mode so . matches newlines (macros often span lines).
+	re := regexp.MustCompile(`(?s)<ac:image[^>]*>.*?<ri:attachment\s+ri:filename="([^"]+)"\s*/?>.*?</ac:image>`)
 	return re.ReplaceAllStringFunc(s, func(match string) string {
 		sub := re.FindStringSubmatch(match)
 		if len(sub) < 2 {
@@ -55,7 +56,7 @@ func replaceACImages(s string, attachments map[string]api.Attachment) string {
 
 // replaceACLinks converts <ac:link> attachment references to markdown link syntax.
 func replaceACLinks(s string, attachments map[string]api.Attachment) string {
-	re := regexp.MustCompile(`<ac:link[^>]*>.*?<ri:attachment\s+ri:filename="([^"]+)"\s*/?>.*?(?:<ac:plain-text-link-body>\s*<!\[CDATA\[([^\]]*)\]\]>\s*</ac:plain-text-link-body>)?.*?</ac:link>`)
+	re := regexp.MustCompile(`(?s)<ac:link[^>]*>.*?<ri:attachment\s+ri:filename="([^"]+)"\s*/?>.*?(?:<ac:plain-text-link-body>\s*<!\[CDATA\[([^\]]*)\]\]>\s*</ac:plain-text-link-body>)?.*?</ac:link>`)
 	return re.ReplaceAllStringFunc(s, func(match string) string {
 		sub := re.FindStringSubmatch(match)
 		if len(sub) < 2 {
@@ -82,19 +83,19 @@ func convertHTMLToMarkdown(s string) string {
 	}
 
 	// Bold.
-	s = regexp.MustCompile(`<strong[^>]*>`).ReplaceAllString(s, "**")
+	s = regexp.MustCompile(`<strong\b[^>]*>`).ReplaceAllString(s, "**")
 	s = strings.ReplaceAll(s, "</strong>", "**")
-	s = regexp.MustCompile(`<b[^>]*>`).ReplaceAllString(s, "**")
+	s = regexp.MustCompile(`<b\b[^>]*>`).ReplaceAllString(s, "**")
 	s = strings.ReplaceAll(s, "</b>", "**")
 
 	// Italic.
-	s = regexp.MustCompile(`<em[^>]*>`).ReplaceAllString(s, "*")
+	s = regexp.MustCompile(`<em\b[^>]*>`).ReplaceAllString(s, "*")
 	s = strings.ReplaceAll(s, "</em>", "*")
-	s = regexp.MustCompile(`<i[^>]*>`).ReplaceAllString(s, "*")
+	s = regexp.MustCompile(`<i\b[^>]*>`).ReplaceAllString(s, "*")
 	s = strings.ReplaceAll(s, "</i>", "*")
 
-	// Code blocks.
-	s = regexp.MustCompile(`<ac:structured-macro[^>]*ac:name="code"[^>]*>.*?<ac:plain-text-body>\s*<!\[CDATA\[(.*?)\]\]>\s*</ac:plain-text-body>\s*</ac:structured-macro>`).
+	// Code blocks ((?s) for multi-line macros).
+	s = regexp.MustCompile(`(?s)<ac:structured-macro[^>]*ac:name="code"[^>]*>.*?<ac:plain-text-body>\s*<!\[CDATA\[(.*?)\]\]>\s*</ac:plain-text-body>\s*</ac:structured-macro>`).
 		ReplaceAllString(s, "\n```\n$1\n```\n")
 
 	// Inline code.
@@ -104,7 +105,21 @@ func convertHTMLToMarkdown(s string) string {
 	// Links.
 	s = regexp.MustCompile(`<a[^>]+href="([^"]*)"[^>]*>(.*?)</a>`).ReplaceAllString(s, "[$2]($1)")
 
-	// List items.
+	// Ordered list items: replace <li> inside <ol> with numbered markers.
+	olRe := regexp.MustCompile(`(?s)<ol[^>]*>(.*?)</ol>`)
+	s = olRe.ReplaceAllStringFunc(s, func(match string) string {
+		inner := olRe.FindStringSubmatch(match)[1]
+		n := 0
+		liRe := regexp.MustCompile(`<li[^>]*>`)
+		inner = liRe.ReplaceAllStringFunc(inner, func(string) string {
+			n++
+			return fmt.Sprintf("%d. ", n)
+		})
+		return inner
+	})
+	s = regexp.MustCompile(`</?ol[^>]*>`).ReplaceAllString(s, "")
+
+	// Unordered list items.
 	s = regexp.MustCompile(`<li[^>]*>`).ReplaceAllString(s, "- ")
 	s = strings.ReplaceAll(s, "</li>", "\n")
 

@@ -177,15 +177,19 @@ func (a *App) RunLs(spaceKey, target string, longFormat bool) error {
 		return nil
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	if longFormat {
+		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 		fmt.Fprintf(w, "PERMS\tNAME\tMODIFIED\tCREATOR\n")
 		fmt.Fprintf(w, "-----\t----\t--------\t-------\n")
+		for _, e := range entries {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", e.Perms, e.Name, e.Modified, e.Creator)
+		}
+		w.Flush()
+	} else {
+		for _, e := range entries {
+			fmt.Println(e.Name)
+		}
 	}
-	for _, e := range entries {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", e.Perms, e.Name, e.Modified, e.Creator)
-	}
-	w.Flush()
 
 	if longFormat {
 		// Summary line to stderr.
@@ -380,8 +384,8 @@ func (a *App) resolvePageID(space *api.Space, target string) (string, error) {
 	target = strings.TrimSuffix(target, "/index.md")
 	target = strings.TrimSuffix(target, "/index.MD")
 
-	// If the target looks like a plain numeric page ID, try using it directly.
-	if !strings.Contains(target, "/") {
+	// If the target looks like a numeric page ID, try using it directly.
+	if !strings.Contains(target, "/") && isNumeric(target) {
 		if _, err := a.Client.GetPageByID(target); err == nil {
 			return target, nil
 		}
@@ -493,9 +497,9 @@ func (a *App) RunReadFile(spaceKey, target, filename string) error {
 	}
 
 	var att *api.Attachment
-	for _, a := range attachments {
-		if strings.EqualFold(a.Title, filename) {
-			att = &a
+	for _, at := range attachments {
+		if strings.EqualFold(at.Title, filename) {
+			att = &at
 			break
 		}
 	}
@@ -524,21 +528,22 @@ func (a *App) RunReadFile(spaceKey, target, filename string) error {
 
 	if strings.HasPrefix(contentType, "text/") {
 		_, err = io.Copy(os.Stdout, resp.Body)
-	} else {
-		// Write binary to file in current directory.
-		outFile, ferr := os.Create(att.Title)
-		if ferr != nil {
-			return fmt.Errorf("create output file: %w", ferr)
-		}
-		defer outFile.Close()
-		n, cerr := io.Copy(outFile, resp.Body)
-		if cerr != nil {
-			return fmt.Errorf("write output file: %w", cerr)
-		}
-		fmt.Fprintf(os.Stderr, "Written to %s (%d bytes)\n", att.Title, n)
+		return err
 	}
 
-	return err
+	// Write binary to file in current directory.
+	safeName := sanitizeFilename(att.Title)
+	outFile, err := os.Create(safeName)
+	if err != nil {
+		return fmt.Errorf("create output file: %w", err)
+	}
+	defer outFile.Close()
+	n, err := io.Copy(outFile, resp.Body)
+	if err != nil {
+		return fmt.Errorf("write output file: %w", err)
+	}
+	fmt.Fprintf(os.Stderr, "Written to %s (%d bytes)\n", safeName, n)
+	return nil
 }
 
 // RunRefresh forces a cache refresh for a space.
@@ -708,7 +713,7 @@ func (a *App) downloadAttachment(att api.Attachment, dir string) error {
 	}
 	defer resp.Body.Close()
 
-	outPath := filepath.Join(dir, att.Title)
+	outPath := filepath.Join(dir, sanitizeFilename(att.Title))
 	f, err := os.Create(outPath)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", outPath, err)
@@ -722,6 +727,30 @@ func (a *App) downloadAttachment(att api.Attachment, dir string) error {
 
 	fmt.Fprintf(os.Stderr, "  %s (%d bytes)\n", outPath, n)
 	return nil
+}
+
+// isNumeric returns true if s consists entirely of ASCII digits.
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// sanitizeFilename strips path separators and traversal sequences from a
+// filename so it cannot escape the target directory.
+func sanitizeFilename(name string) string {
+	// Use only the base name to prevent directory traversal.
+	name = filepath.Base(name)
+	if name == "." || name == ".." || name == "" {
+		name = "_"
+	}
+	return name
 }
 
 // sanitizeName replaces characters that are invalid in file/directory names.

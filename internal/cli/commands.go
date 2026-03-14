@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -556,6 +557,192 @@ func (a *App) RunRefresh(spaceKey string) error {
 
 	fmt.Fprintf(os.Stderr, "Cached %d pages (at %s)\n", len(cs.Pages), cs.UpdatedAt.Format("2006-01-02 15:04:05"))
 	return nil
+}
+
+// RunMirror mirrors an entire Confluence space into a local directory.
+// Each page becomes a folder with an index.md file and its attachments.
+func (a *App) RunMirror(spaceKey, targetDir string) error {
+	space, err := a.resolveSpace(spaceKey)
+	if err != nil {
+		return err
+	}
+
+	cs, err := a.Cache.EnsureLoaded(a.Client, *space)
+	if err != nil {
+		return err
+	}
+
+	if len(cs.Pages) == 0 {
+		fmt.Fprintf(os.Stderr, "No pages in space %s.\n", spaceKey)
+		return nil
+	}
+
+	roots := cache.BuildTree(cs.Pages)
+	sortNodes(roots)
+
+	// Skip homepage wrapper — show its children as top-level entries.
+	displayRoots := roots
+	var homepageNode *cache.PageNode
+	if space.HomepageID != "" {
+		homepageNode = cache.FindNode(roots, space.HomepageID)
+		if homepageNode != nil {
+			displayRoots = homepageNode.Children
+		}
+	}
+
+	// Create target directory.
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return fmt.Errorf("create target directory: %w", err)
+	}
+
+	// Download homepage content into the root directory.
+	if homepageNode != nil {
+		if err := a.downloadPage(homepageNode.Page.ID, targetDir); err != nil {
+			return fmt.Errorf("download homepage: %w", err)
+		}
+	}
+
+	// Download all child pages recursively.
+	for _, node := range displayRoots {
+		if err := a.downloadTree(node, targetDir); err != nil {
+			return err
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "\nMirrored space %s to %s\n", spaceKey, targetDir)
+	return nil
+}
+
+// downloadTree recursively downloads a page node and its children.
+func (a *App) downloadTree(node *cache.PageNode, parentDir string) error {
+	dirName := sanitizeName(node.Page.Title)
+	dir := filepath.Join(parentDir, dirName)
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create directory %s: %w", dir, err)
+	}
+
+	if err := a.downloadPage(node.Page.ID, dir); err != nil {
+		return err
+	}
+
+	for _, child := range node.Children {
+		if err := a.downloadTree(child, dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// downloadPage fetches a page, converts it to markdown, saves index.md,
+// and downloads all attachments into the same directory.
+func (a *App) downloadPage(pageID, dir string) error {
+	page, err := a.Client.GetPageByID(pageID)
+	if err != nil {
+		return fmt.Errorf("fetch page %s: %w", pageID, err)
+	}
+
+	attachments, err := a.Client.GetAttachmentsForPage(pageID)
+	if err != nil {
+		return fmt.Errorf("fetch attachments for page %s: %w", pageID, err)
+	}
+
+	// Convert to markdown.
+	var body string
+	if page.Body != nil && page.Body.Storage != nil {
+		body = page.Body.Storage.Value
+	}
+	md := convert.ToMarkdown(body, attachments)
+
+	// Rewrite attachment:filename references to local filenames.
+	md = strings.ReplaceAll(md, "(attachment:", "(")
+
+	var meta strings.Builder
+	meta.WriteString("---\n")
+	fmt.Fprintf(&meta, "title: %q\n", page.Title)
+	fmt.Fprintf(&meta, "page_id: %s\n", page.ID)
+	fmt.Fprintf(&meta, "version: %d\n", page.Version.Number)
+	if page.CreatedAt != "" {
+		fmt.Fprintf(&meta, "created_at: %s\n", page.CreatedAt)
+	}
+	fmt.Fprintf(&meta, "author_id: %s\n", page.AuthorID)
+	if page.Version.CreatedAt != "" {
+		fmt.Fprintf(&meta, "modified_at: %s\n", page.Version.CreatedAt)
+	}
+	fmt.Fprintf(&meta, "modified_by: %s\n", page.Version.AuthorID)
+	if page.Links.WebUI != "" {
+		fmt.Fprintf(&meta, "source: %s%s\n", a.Client.BaseURL, page.Links.WebUI)
+	}
+	meta.WriteString("---\n\n")
+
+	content := fmt.Sprintf("%s# %s\n\n%s\n", meta.String(), page.Title, md)
+	indexPath := filepath.Join(dir, "index.md")
+	if err := os.WriteFile(indexPath, []byte(content), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", indexPath, err)
+	}
+	fmt.Fprintf(os.Stderr, "  %s\n", indexPath)
+
+	// Download attachments into the same directory.
+	for _, att := range attachments {
+		if err := a.downloadAttachment(att, dir); err != nil {
+			fmt.Fprintf(os.Stderr, "  warning: %v\n", err)
+		}
+	}
+
+	return nil
+}
+
+// downloadAttachment downloads a single attachment into dir.
+func (a *App) downloadAttachment(att api.Attachment, dir string) error {
+	downloadPath := att.Links.Download
+	if downloadPath == "" {
+		downloadPath = att.DownloadLink
+	}
+	if downloadPath == "" {
+		return fmt.Errorf("no download link for %q", att.Title)
+	}
+
+	resp, err := a.Client.DownloadAttachment(downloadPath)
+	if err != nil {
+		return fmt.Errorf("download %q: %w", att.Title, err)
+	}
+	defer resp.Body.Close()
+
+	outPath := filepath.Join(dir, att.Title)
+	f, err := os.Create(outPath)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", outPath, err)
+	}
+	defer f.Close()
+
+	n, err := io.Copy(f, resp.Body)
+	if err != nil {
+		return fmt.Errorf("write %s: %w", outPath, err)
+	}
+
+	fmt.Fprintf(os.Stderr, "  %s (%d bytes)\n", outPath, n)
+	return nil
+}
+
+// sanitizeName replaces characters that are invalid in file/directory names.
+func sanitizeName(name string) string {
+	replacer := strings.NewReplacer(
+		"/", "_",
+		"\\", "_",
+		":", "_",
+		"*", "_",
+		"?", "_",
+		"\"", "_",
+		"<", "_",
+		">", "_",
+		"|", "_",
+	)
+	s := replacer.Replace(name)
+	s = strings.TrimSpace(s)
+	if s == "" {
+		s = "_"
+	}
+	return s
 }
 
 // RunConfigure interactively prompts for Basic Auth credentials and writes the config file.

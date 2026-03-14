@@ -25,6 +25,7 @@ Commands:
   read <space-key> <page-id|/path>      Read a page as markdown
   read-file <space-key> <page-id|/path> <filename>
                                          Download an attachment
+  mirror <space-key> <target-dir>        Mirror entire space to local directory
   refresh <space-key>                    Refresh the local cache for a space
 
 Configuration:
@@ -133,6 +134,12 @@ func main() {
 			die("usage: confluence-reader read-file <space-key> <page-id|/path> <filename>")
 		}
 		err = app.RunReadFile(args[0], args[1], args[2])
+
+	case "mirror":
+		if len(args) < 2 {
+			die("usage: confluence-reader mirror <space-key> <target-dir>")
+		}
+		err = app.RunMirror(args[0], args[1])
 
 	case "refresh":
 		if len(args) < 1 {

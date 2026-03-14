@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -602,6 +603,18 @@ func (a *App) RunMirror(spaceKey, targetDir string, allFiles, refresh bool) erro
 	}
 	bar := progress.New("Mirroring pages", total)
 
+	// If the target directory exists, verify it belongs to this space.
+	if info, statErr := os.Stat(targetDir); statErr == nil && info.IsDir() {
+		if meta, err := readSyncMetadata(targetDir); err == nil && meta != nil {
+			if !strings.EqualFold(meta.SpaceKey, spaceKey) {
+				return fmt.Errorf("target directory %s was previously mirrored from space %q, not %q; use a different directory", targetDir, meta.SpaceKey, spaceKey)
+			}
+		}
+	}
+
+	// Track all paths written during this mirror run.
+	written := make(map[string]bool)
+
 	// Create target directory.
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		return fmt.Errorf("create target directory: %w", err)
@@ -609,18 +622,29 @@ func (a *App) RunMirror(spaceKey, targetDir string, allFiles, refresh bool) erro
 
 	// Download homepage content into the root directory.
 	if homepageNode != nil {
-		if err := a.downloadPage(cs, homepageNode.Page.ID, homepageNode.Page.Title, targetDir, allFiles, bar); err != nil {
+		if err := a.downloadPage(cs, homepageNode.Page.ID, homepageNode.Page.Title, targetDir, allFiles, bar, written); err != nil {
 			return fmt.Errorf("download homepage: %w", err)
 		}
 	}
 
 	// Download all child pages recursively.
 	for _, node := range displayRoots {
-		if err := a.downloadTree(cs, node, targetDir, allFiles, bar); err != nil {
+		if err := a.downloadTree(cs, node, targetDir, allFiles, bar, written); err != nil {
 			return err
 		}
 	}
 	bar.Finish()
+
+	// Write sync metadata.
+	if err := writeSyncMetadata(targetDir, spaceKey, total); err != nil {
+		return fmt.Errorf("write sync metadata: %w", err)
+	}
+
+	// Remove files and directories that no longer exist in the space.
+	removed := cleanStaleEntries(targetDir, written)
+	if removed > 0 {
+		fmt.Fprintf(os.Stderr, "Removed %d stale files/directories\n", removed)
+	}
 
 	// Persist the updated rename map.
 	if err := a.Cache.Save(cs); err != nil {
@@ -632,20 +656,21 @@ func (a *App) RunMirror(spaceKey, targetDir string, allFiles, refresh bool) erro
 }
 
 // downloadTree recursively downloads a page node and its children.
-func (a *App) downloadTree(cs *cache.CachedSpace, node *cache.PageNode, parentDir string, allFiles bool, bar *progress.Bar) error {
+func (a *App) downloadTree(cs *cache.CachedSpace, node *cache.PageNode, parentDir string, allFiles bool, bar *progress.Bar, written map[string]bool) error {
 	dirName := sanitizeName(node.Page.Title)
 	dir := filepath.Join(parentDir, dirName)
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create directory %s: %w", dir, err)
 	}
+	written[dir] = true
 
-	if err := a.downloadPage(cs, node.Page.ID, node.Page.Title, dir, allFiles, bar); err != nil {
+	if err := a.downloadPage(cs, node.Page.ID, node.Page.Title, dir, allFiles, bar, written); err != nil {
 		return err
 	}
 
 	for _, child := range node.Children {
-		if err := a.downloadTree(cs, child, dir, allFiles, bar); err != nil {
+		if err := a.downloadTree(cs, child, dir, allFiles, bar, written); err != nil {
 			return err
 		}
 	}
@@ -655,7 +680,7 @@ func (a *App) downloadTree(cs *cache.CachedSpace, node *cache.PageNode, parentDi
 // downloadPage fetches a page, converts it to markdown, saves index.md,
 // and downloads attachments (with renamed filenames) into the same directory.
 // When allFiles is false, only attachments referenced in the page body are downloaded.
-func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string, allFiles bool, bar *progress.Bar) error {
+func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string, allFiles bool, bar *progress.Bar, written map[string]bool) error {
 	page, err := a.Client.GetPageByID(pageID)
 	if err != nil {
 		return fmt.Errorf("fetch page %s: %w", pageID, err)
@@ -722,6 +747,7 @@ func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string,
 	if err := os.WriteFile(indexPath, []byte(content), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", indexPath, err)
 	}
+	written[indexPath] = true
 	bar.Increment()
 
 	// Determine which attachments to download.
@@ -740,6 +766,8 @@ func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string,
 	// Download attachments into the same directory with renamed filenames.
 	for _, att := range downloadAtts {
 		newName := renameMap[att.Title]
+		outPath := filepath.Join(dir, sanitizeFilename(newName))
+		written[outPath] = true
 		if err := a.downloadAttachment(cs, att, pageID, newName, dir); err != nil {
 			bar.Log("warning: %v", err)
 		}
@@ -788,6 +816,92 @@ func (a *App) downloadAttachment(cs *cache.CachedSpace, att api.Attachment, page
 	}
 
 	return nil
+}
+
+// syncMetadataFile is the name of the file written to the mirror root to
+// identify it as a confluence-reader mirror directory.
+const syncMetadataFile = ".confluence-sync.json"
+
+// syncMetadata is the JSON structure stored in the sync metadata file.
+type syncMetadata struct {
+	SpaceKey  string `json:"space_key"`
+	SyncedAt  string `json:"synced_at"`
+	PageCount int    `json:"page_count"`
+}
+
+// writeSyncMetadata writes a metadata file to the mirror root.
+func writeSyncMetadata(targetDir, spaceKey string, pageCount int) error {
+	meta := syncMetadata{
+		SpaceKey:  spaceKey,
+		SyncedAt:  time.Now().UTC().Format(time.RFC3339),
+		PageCount: pageCount,
+	}
+	data, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(targetDir, syncMetadataFile), data, 0o644)
+}
+
+// readSyncMetadata reads the sync metadata from a mirror directory.
+// Returns nil if the file does not exist.
+func readSyncMetadata(targetDir string) (*syncMetadata, error) {
+	data, err := os.ReadFile(filepath.Join(targetDir, syncMetadataFile))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var meta syncMetadata
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, err
+	}
+	return &meta, nil
+}
+
+// cleanStaleEntries removes files and empty directories under root that
+// are not in the written set. Returns the number of entries removed.
+func cleanStaleEntries(root string, written map[string]bool) int {
+	removed := 0
+	// Collect all entries first, then remove in reverse order so that
+	// child entries are removed before their parent directories.
+	var entries []string
+	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		// Never remove the root directory itself or the sync metadata file.
+		if path == root || filepath.Base(path) == syncMetadataFile {
+			return nil
+		}
+		entries = append(entries, path)
+		return nil
+	})
+
+	// Process in reverse order (deepest paths first).
+	for i := len(entries) - 1; i >= 0; i-- {
+		path := entries[i]
+		if written[path] {
+			continue
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			// Only remove if empty (all contents already cleaned).
+			dirEntries, err := os.ReadDir(path)
+			if err != nil || len(dirEntries) > 0 {
+				continue
+			}
+			os.Remove(path)
+		} else {
+			os.Remove(path)
+		}
+		removed++
+	}
+	return removed
 }
 
 // isNumeric returns true if s consists entirely of ASCII digits.

@@ -19,14 +19,19 @@ Options:
 Commands:
   configure                              Set up Confluence credentials
   spaces                                 List all accessible spaces
-  ls [-l] <space-key> [page-id|/path]    List child pages (like unix ls)
-  tree <space-key>                       List page tree in a space
-  find <space-key> [query]               Find pages by title (or list all)
-  read <space-key> <page-id|/path>      Read a page as markdown
-  read-file <space-key> <page-id|/path> <filename>
+  ls [-l] [-r] <space-key> [page-id|/path]
+                                         List child pages (like unix ls)
+  tree [-r] <space-key>                  List page tree in a space
+  find [-r] <space-key> [query]          Find pages by title (or list all)
+  read [-r] <space-key> <page-id|/path>  Read a page as markdown
+  read-file [-r] <space-key> <page-id|/path> <filename>
                                          Download an attachment
-  mirror <space-key> <target-dir>        Mirror entire space to local directory
+  mirror [-r] <space-key> <target-dir>   Mirror entire space to local directory
   refresh <space-key>                    Refresh the local cache for a space
+
+Flags:
+  -l, --long       Show detailed listing (ls only)
+  -r, --refresh    Force a cache refresh before running the command
 
 Configuration:
   Run 'confluence-reader configure' to set up your credentials.
@@ -86,60 +91,67 @@ func main() {
 		err = app.RunSpaces()
 
 	case "ls":
-		// Parse ls-specific flags: -l for long format.
 		longFormat := false
+		refresh := false
 		lsArgs := args
 		for len(lsArgs) > 0 && strings.HasPrefix(lsArgs[0], "-") {
 			switch lsArgs[0] {
 			case "-l", "--long":
 				longFormat = true
+			case "-r", "--refresh":
+				refresh = true
 			default:
 				die("ls: unknown flag: " + lsArgs[0])
 			}
 			lsArgs = lsArgs[1:]
 		}
 		if len(lsArgs) < 1 {
-			die("usage: confluence-reader ls [-l] <space-key> [page-id|/path]")
+			die("usage: confluence-reader ls [-l] [-r] <space-key> [page-id|/path]")
 		}
 		target := ""
 		if len(lsArgs) >= 2 {
 			target = lsArgs[1]
 		}
-		err = app.RunLs(lsArgs[0], target, longFormat)
+		err = app.RunLs(lsArgs[0], target, longFormat, refresh)
 
 	case "tree":
-		if len(args) < 1 {
-			die("usage: confluence-reader tree <space-key>")
+		refresh, cmdArgs := parseRefreshFlag(args)
+		if len(cmdArgs) < 1 {
+			die("usage: confluence-reader tree [-r] <space-key>")
 		}
-		err = app.RunTree(args[0])
+		err = app.RunTree(cmdArgs[0], refresh)
 
 	case "find":
-		if len(args) < 1 {
-			die("usage: confluence-reader find <space-key> [query]")
+		refresh, cmdArgs := parseRefreshFlag(args)
+		if len(cmdArgs) < 1 {
+			die("usage: confluence-reader find [-r] <space-key> [query]")
 		}
 		query := ""
-		if len(args) >= 2 {
-			query = args[1]
+		if len(cmdArgs) >= 2 {
+			query = cmdArgs[1]
 		}
-		err = app.RunFind(args[0], query)
+		err = app.RunFind(cmdArgs[0], query, refresh)
 
 	case "read":
-		if len(args) < 2 {
-			die("usage: confluence-reader read <space-key> <page-id|/path>")
+		refresh, cmdArgs := parseRefreshFlag(args)
+		if len(cmdArgs) < 2 {
+			die("usage: confluence-reader read [-r] <space-key> <page-id|/path>")
 		}
-		err = app.RunRead(args[0], args[1])
+		err = app.RunRead(cmdArgs[0], cmdArgs[1], refresh)
 
 	case "read-file":
-		if len(args) < 3 {
-			die("usage: confluence-reader read-file <space-key> <page-id|/path> <filename>")
+		refresh, cmdArgs := parseRefreshFlag(args)
+		if len(cmdArgs) < 3 {
+			die("usage: confluence-reader read-file [-r] <space-key> <page-id|/path> <filename>")
 		}
-		err = app.RunReadFile(args[0], args[1], args[2])
+		err = app.RunReadFile(cmdArgs[0], cmdArgs[1], cmdArgs[2], refresh)
 
 	case "mirror":
-		if len(args) < 2 {
-			die("usage: confluence-reader mirror <space-key> <target-dir>")
+		refresh, cmdArgs := parseRefreshFlag(args)
+		if len(cmdArgs) < 2 {
+			die("usage: confluence-reader mirror [-r] <space-key> <target-dir>")
 		}
-		err = app.RunMirror(args[0], args[1])
+		err = app.RunMirror(cmdArgs[0], cmdArgs[1], refresh)
 
 	case "refresh":
 		if len(args) < 1 {
@@ -157,6 +169,23 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// parseRefreshFlag extracts -r/--refresh from arguments, returning the
+// flag value and the remaining arguments.
+func parseRefreshFlag(args []string) (bool, []string) {
+	refresh := false
+	remaining := args
+	for len(remaining) > 0 && strings.HasPrefix(remaining[0], "-") {
+		switch remaining[0] {
+		case "-r", "--refresh":
+			refresh = true
+		default:
+			die("unknown flag: " + remaining[0])
+		}
+		remaining = remaining[1:]
+	}
+	return refresh, remaining
 }
 
 func die(msg string) {

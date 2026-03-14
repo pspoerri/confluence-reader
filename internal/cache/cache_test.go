@@ -137,3 +137,50 @@ func TestCountNodes_Empty(t *testing.T) {
 		t.Errorf("expected 0 for nil roots, got %d", count)
 	}
 }
+
+func TestBuildChildrenMap(t *testing.T) {
+	pages := []api.Page{
+		{ID: "1", Title: "Home", ParentID: "ext-space", ParentType: "page"},
+		{ID: "2", Title: "Child A", ParentID: "1", ParentType: "page", Position: 0},
+		{ID: "3", Title: "Child B", ParentID: "1", ParentType: "page", Position: 1},
+		{ID: "4", Title: "Grandchild", ParentID: "2", ParentType: "page", Position: 0},
+	}
+
+	children := buildChildrenMap(pages)
+
+	// Page 1 should have 2 children.
+	if len(children["1"]) != 2 {
+		t.Errorf("expected 2 children for page 1, got %d", len(children["1"]))
+	}
+
+	// Page 2 should have 1 child.
+	if len(children["2"]) != 1 {
+		t.Errorf("expected 1 child for page 2, got %d", len(children["2"]))
+	}
+
+	// Page 3 (leaf) should have key present but nil value.
+	if _, ok := children["3"]; !ok {
+		t.Error("expected key '3' to exist in children map")
+	}
+	if children["3"] != nil {
+		t.Errorf("expected nil children for page 3, got %v", children["3"])
+	}
+}
+
+func TestDeriveChildren(t *testing.T) {
+	pages := []api.Page{
+		{ID: "1", Title: "Home", ParentID: "ext-space", ParentType: "page"},
+		{ID: "2", Title: "Child A", ParentID: "1", ParentType: "page"},
+		{ID: "3", Title: "Child B", ParentID: "1", ParentType: "page"},
+	}
+
+	children := deriveChildren(pages, "1")
+	if len(children) != 2 {
+		t.Errorf("expected 2 children for page 1, got %d", len(children))
+	}
+
+	noChildren := deriveChildren(pages, "2")
+	if len(noChildren) != 0 {
+		t.Errorf("expected 0 children for page 2, got %d", len(noChildren))
+	}
+}

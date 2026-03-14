@@ -78,6 +78,24 @@ func (a *App) resolveSpace(spaceKey string) (*api.Space, error) {
 	return nil, fmt.Errorf("space %q not found", spaceKey)
 }
 
+// ensureSpace loads or creates the cache, optionally forcing a full refresh.
+func (a *App) ensureSpace(space *api.Space, refresh bool) (*cache.CachedSpace, error) {
+	if refresh {
+		fmt.Fprintf(os.Stderr, "Refreshing cache for space %s (%s)...\n", space.Key, space.Name)
+		return a.Cache.Refresh(a.Client, *space)
+	}
+	return a.Cache.EnsureSpace(a.Client, *space)
+}
+
+// ensureLoaded loads a fully populated cache, optionally forcing a refresh.
+func (a *App) ensureLoaded(space *api.Space, refresh bool) (*cache.CachedSpace, error) {
+	if refresh {
+		fmt.Fprintf(os.Stderr, "Refreshing cache for space %s (%s)...\n", space.Key, space.Name)
+		return a.Cache.Refresh(a.Client, *space)
+	}
+	return a.Cache.EnsureLoaded(a.Client, *space)
+}
+
 // lsEntry is a single item in an ls listing. It can represent a child page
 // (shown as a directory), the virtual index.md, or an attachment file.
 type lsEntry struct {
@@ -87,90 +105,77 @@ type lsEntry struct {
 	Creator  string // author/editor ID
 }
 
-// RunLs lists pages like unix ls. Every page in Confluence is a directory that
-// can contain child pages. With no target it lists root pages; with a page ID
-// or slash-path it lists children of that page. When targeting a leaf page
-// (no children) it displays the page's own metadata, like ls on a single file.
-//
-// Inside every "directory" that has children, a virtual index.md entry
-// represents the page's own content. Attachments are shown as files.
-func (a *App) RunLs(spaceKey, target string, longFormat bool) error {
+// RunLs lists pages like unix ls. Uses lazy caching: only fetches the
+// children and attachments of the viewed page, not the entire space.
+func (a *App) RunLs(spaceKey, target string, longFormat, refresh bool) error {
 	space, err := a.resolveSpace(spaceKey)
 	if err != nil {
 		return err
 	}
 
-	cs, err := a.Cache.EnsureLoaded(a.Client, *space)
+	cs, err := a.ensureSpace(space, refresh)
 	if err != nil {
 		return err
 	}
 
-	if len(cs.Pages) == 0 {
-		fmt.Printf("No pages in space %s.\n", spaceKey)
-		return nil
-	}
-
-	roots := cache.BuildTree(cs.Pages)
-	sortNodes(roots)
-
-	// Visible roots: skip the space homepage wrapper.
-	visibleRoots := roots
-	if space.HomepageID != "" {
-		if hp := cache.FindNode(roots, space.HomepageID); hp != nil {
-			visibleRoots = hp.Children
-		}
-	}
-
-	// Resolve target to a page node.
-	var parent *cache.PageNode
-
-	if target != "" && target != "/" {
-		if strings.HasPrefix(target, "/") {
-			parent = cache.FindNodeByPath(visibleRoots, target)
-		} else {
-			parent = cache.FindNode(roots, target)
-			if parent == nil {
-				parent = cache.FindNodeByPath(visibleRoots, target)
-			}
-		}
-		if parent == nil {
-			return fmt.Errorf("page not found: %s", target)
-		}
-	}
-
-	// Build the listing entries.
-	var entries []lsEntry
 	perms := operationsToPerms(cs.Operations)
 
-	if parent == nil {
-		// Root listing: show homepage content as index.md, its child pages
-		// as directories, and any homepage attachments as files.
-		if space.HomepageID != "" {
-			if hp := cache.FindNode(roots, space.HomepageID); hp != nil {
-				entries = append(entries, lsEntry{
-					Perms:    perms,
-					Name:     "index.md",
-					Modified: formatTime(hp.Page.Version.CreatedAt),
-					Creator:  hp.Page.Version.AuthorID,
-				})
-				entries = append(entries, attachmentEntries(cs, hp.Page.ID, perms)...)
-			}
+	// Resolve target to a page ID. Default to the homepage.
+	pageID := space.HomepageID
+	if pageID == "" {
+		fmt.Println("No pages found.")
+		return nil
+	}
+	if target != "" && target != "/" {
+		pageID, err = a.resolveTarget(cs, space, target)
+		if err != nil {
+			return err
 		}
-		for _, node := range visibleRoots {
-			entries = append(entries, nodeEntry(node, perms))
+	}
+
+	// Fetch children and attachments lazily for this page.
+	children, err := a.Cache.EnsureChildren(a.Client, cs, pageID)
+	if err != nil {
+		return err
+	}
+	sort.Slice(children, func(i, j int) bool {
+		return children[i].ChildPosition < children[j].ChildPosition
+	})
+
+	attachments, err := a.Cache.EnsureAttachments(a.Client, cs, pageID)
+	if err != nil {
+		return err
+	}
+
+	// Build entries.
+	var entries []lsEntry
+
+	// index.md for the page content.
+	indexEntry := lsEntry{Perms: perms, Name: "index.md", Modified: "-", Creator: "-"}
+	if p := findPageInList(cs.Pages, pageID); p != nil {
+		indexEntry.Modified = formatTime(p.Version.CreatedAt)
+		indexEntry.Creator = p.Version.AuthorID
+	}
+	entries = append(entries, indexEntry)
+
+	// Child pages as directories.
+	for _, child := range children {
+		entry := lsEntry{Perms: perms, Name: child.Title + "/", Modified: "-", Creator: "-"}
+		if p := findPageInList(cs.Pages, child.ID); p != nil {
+			entry.Modified = formatTime(p.Version.CreatedAt)
+			entry.Creator = p.Version.AuthorID
 		}
-	} else {
-		// Inside a page: index.md (page content) + child folders + attachments.
+		entries = append(entries, entry)
+	}
+
+	// Attachments as files.
+	for _, att := range attachments {
 		entries = append(entries, lsEntry{
 			Perms:    perms,
-			Name:     "index.md",
-			Modified: formatTime(parent.Page.Version.CreatedAt),
-			Creator:  parent.Page.Version.AuthorID,
+			Name:     att.Title,
+			Modified: formatTime(att.Version.CreatedAt),
+			Creator:  att.Version.AuthorID,
 		})
-		for _, child := range parent.Children {
-			entries = append(entries, nodeEntry(child, perms))
-		}
-		entries = append(entries, attachmentEntries(cs, parent.Page.ID, perms)...)
 	}
 
 	if len(entries) == 0 {
@@ -178,6 +183,7 @@ func (a *App) RunLs(spaceKey, target string, longFormat bool) error {
 		return nil
 	}
 
+	// Display.
 	if longFormat {
 		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 		fmt.Fprintf(w, "PERMS\tNAME\tMODIFIED\tCREATOR\n")
@@ -186,50 +192,71 @@ func (a *App) RunLs(spaceKey, target string, longFormat bool) error {
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", e.Perms, e.Name, e.Modified, e.Creator)
 		}
 		w.Flush()
+		fmt.Fprintf(os.Stderr, "\n%d items\n", len(entries))
 	} else {
 		for _, e := range entries {
 			fmt.Println(e.Name)
 		}
 	}
-
-	if longFormat {
-		// Summary line to stderr.
-		location := "/"
-		if parent != nil {
-			location = cache.PagePath(cs.Pages, parent.Page.ID)
-		}
-		fmt.Fprintf(os.Stderr, "\n%d items in %s\n", len(entries), location)
-	}
 	return nil
 }
 
-// nodeEntry creates an lsEntry for a child page node.
-func nodeEntry(node *cache.PageNode, perms string) lsEntry {
-	name := node.Page.Title + "/"
-	return lsEntry{
-		Perms:    perms,
-		Name:     name,
-		Modified: formatTime(node.Page.Version.CreatedAt),
-		Creator:  node.Page.Version.AuthorID,
+// resolveTarget resolves a target that can be a page ID, a slash-separated
+// path (e.g. "/Parent/Child"), or a bare page title to a page ID.
+// Uses the full tree if cached, otherwise resolves lazily.
+func (a *App) resolveTarget(cs *cache.CachedSpace, space *api.Space, target string) (string, error) {
+	target = strings.TrimSuffix(target, "/index.md")
+	target = strings.TrimSuffix(target, "/index.MD")
+
+	// Numeric page ID: try directly.
+	if !strings.Contains(target, "/") && isNumeric(target) {
+		if _, err := a.Client.GetPageByID(target); err == nil {
+			return target, nil
+		}
 	}
+
+	// If the full page list is cached, use tree-based resolution.
+	if len(cs.Pages) > 0 {
+		roots := cache.BuildTree(cs.Pages)
+		visibleRoots := roots
+		if space.HomepageID != "" {
+			if hp := cache.FindNode(roots, space.HomepageID); hp != nil {
+				visibleRoots = hp.Children
+			}
+		}
+
+		var node *cache.PageNode
+		if strings.HasPrefix(target, "/") {
+			node = cache.FindNodeByPath(visibleRoots, target)
+		} else {
+			node = cache.FindNode(roots, target)
+			if node == nil {
+				node = cache.FindNodeByPath(visibleRoots, target)
+			}
+		}
+		if node != nil {
+			return node.Page.ID, nil
+		}
+		return "", fmt.Errorf("page not found: %s", target)
+	}
+
+	// Lazy path resolution.
+	if strings.HasPrefix(target, "/") || !strings.Contains(target, "/") {
+		return a.Cache.ResolvePath(a.Client, cs, space.HomepageID, target)
+	}
+
+	return "", fmt.Errorf("page not found: %s", target)
 }
 
-// attachmentEntries creates lsEntries for all cached attachments of a page.
-func attachmentEntries(cs *cache.CachedSpace, pageID string, perms string) []lsEntry {
-	atts := cs.Attachments[pageID]
-	if len(atts) == 0 {
-		return nil
+// findPageInList looks up a page by ID in the full page list.
+// Returns nil if the page list is empty or the page is not found.
+func findPageInList(pages []api.Page, pageID string) *api.Page {
+	for i := range pages {
+		if pages[i].ID == pageID {
+			return &pages[i]
+		}
 	}
-	entries := make([]lsEntry, 0, len(atts))
-	for _, att := range atts {
-		entries = append(entries, lsEntry{
-			Perms:    perms,
-			Name:     att.Title,
-			Modified: formatTime(att.Version.CreatedAt),
-			Creator:  att.Version.AuthorID,
-		})
-	}
-	return entries
+	return nil
 }
 
 // formatTime parses an API timestamp and returns a short human-readable form.
@@ -284,13 +311,13 @@ func operationsToPerms(ops []api.Operation) string {
 }
 
 // RunTree lists pages in a space as a tree.
-func (a *App) RunTree(spaceKey string) error {
+func (a *App) RunTree(spaceKey string, refresh bool) error {
 	space, err := a.resolveSpace(spaceKey)
 	if err != nil {
 		return err
 	}
 
-	cs, err := a.Cache.EnsureLoaded(a.Client, *space)
+	cs, err := a.ensureLoaded(space, refresh)
 	if err != nil {
 		return err
 	}
@@ -346,13 +373,13 @@ func printTree(w io.Writer, node *cache.PageNode, prefix string, last bool) {
 }
 
 // RunFind searches for pages matching a query within a space.
-func (a *App) RunFind(spaceKey, query string) error {
+func (a *App) RunFind(spaceKey, query string, refresh bool) error {
 	space, err := a.resolveSpace(spaceKey)
 	if err != nil {
 		return err
 	}
 
-	cs, err := a.Cache.EnsureLoaded(a.Client, *space)
+	cs, err := a.ensureLoaded(space, refresh)
 	if err != nil {
 		return err
 	}
@@ -376,66 +403,19 @@ func (a *App) RunFind(spaceKey, query string) error {
 	return nil
 }
 
-// resolvePageID resolves a target that can be a page ID, a slash-separated
-// path (e.g. "/Parent/Child"), or a bare page title to the actual page ID.
-// Paths ending in /index.md are normalised by stripping the suffix.
-func (a *App) resolvePageID(space *api.Space, target string) (string, error) {
-	// Strip trailing /index.md — the virtual entry that represents
-	// a page's own content in ls listings.
-	target = strings.TrimSuffix(target, "/index.md")
-	target = strings.TrimSuffix(target, "/index.MD")
-
-	// If the target looks like a numeric page ID, try using it directly.
-	if !strings.Contains(target, "/") && isNumeric(target) {
-		if _, err := a.Client.GetPageByID(target); err == nil {
-			return target, nil
-		}
-	}
-
-	// Otherwise resolve via the cached page tree.
-	cs, err := a.Cache.EnsureLoaded(a.Client, *space)
-	if err != nil {
-		return "", err
-	}
-	if len(cs.Pages) == 0 {
-		return "", fmt.Errorf("no pages in space %s", space.Key)
-	}
-
-	roots := cache.BuildTree(cs.Pages)
-	sortNodes(roots)
-
-	// Visible roots: skip the space homepage wrapper.
-	visibleRoots := roots
-	if space.HomepageID != "" {
-		if hp := cache.FindNode(roots, space.HomepageID); hp != nil {
-			visibleRoots = hp.Children
-		}
-	}
-
-	var node *cache.PageNode
-	if strings.HasPrefix(target, "/") {
-		node = cache.FindNodeByPath(visibleRoots, target)
-	} else {
-		// Try as page ID first, then as a path/title.
-		node = cache.FindNode(roots, target)
-		if node == nil {
-			node = cache.FindNodeByPath(visibleRoots, target)
-		}
-	}
-	if node == nil {
-		return "", fmt.Errorf("page not found: %s", target)
-	}
-	return node.Page.ID, nil
-}
-
 // RunRead reads a page by ID or path, converts to markdown, includes attachment refs.
-func (a *App) RunRead(spaceKey, target string) error {
+func (a *App) RunRead(spaceKey, target string, refresh bool) error {
 	space, err := a.resolveSpace(spaceKey)
 	if err != nil {
 		return err
 	}
 
-	pageID, err := a.resolvePageID(space, target)
+	cs, err := a.ensureSpace(space, refresh)
+	if err != nil {
+		return err
+	}
+
+	pageID, err := a.resolveTarget(cs, space, target)
 	if err != nil {
 		return err
 	}
@@ -472,13 +452,18 @@ func (a *App) RunRead(spaceKey, target string) error {
 }
 
 // RunReadFile downloads an attachment by page ID (or path) and filename.
-func (a *App) RunReadFile(spaceKey, target, filename string) error {
+func (a *App) RunReadFile(spaceKey, target, filename string, refresh bool) error {
 	space, err := a.resolveSpace(spaceKey)
 	if err != nil {
 		return err
 	}
 
-	pageID, err := a.resolvePageID(space, target)
+	cs, err := a.ensureSpace(space, refresh)
+	if err != nil {
+		return err
+	}
+
+	pageID, err := a.resolveTarget(cs, space, target)
 	if err != nil {
 		return err
 	}
@@ -567,13 +552,13 @@ func (a *App) RunRefresh(spaceKey string) error {
 
 // RunMirror mirrors an entire Confluence space into a local directory.
 // Each page becomes a folder with an index.md file and its attachments.
-func (a *App) RunMirror(spaceKey, targetDir string) error {
+func (a *App) RunMirror(spaceKey, targetDir string, refresh bool) error {
 	space, err := a.resolveSpace(spaceKey)
 	if err != nil {
 		return err
 	}
 
-	cs, err := a.Cache.EnsureLoaded(a.Client, *space)
+	cs, err := a.ensureLoaded(space, refresh)
 	if err != nil {
 		return err
 	}

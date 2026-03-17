@@ -443,8 +443,8 @@ func (a *App) RunRead(spaceKey, target string, refresh bool) error {
 		return fmt.Errorf("page %s does not belong to space %s", pageID, spaceKey)
 	}
 
-	// Get attachments.
-	attachments, err := a.Client.GetAttachmentsForPage(pageID)
+	// Get attachments (lazily cached).
+	attachments, err := a.Cache.EnsureAttachments(a.Client, cs, pageID)
 	if err != nil {
 		return fmt.Errorf("fetch attachments: %w", err)
 	}
@@ -491,7 +491,7 @@ func (a *App) RunReadFile(spaceKey, target, filename string, refresh bool) error
 		return fmt.Errorf("page %s does not belong to space %s", pageID, spaceKey)
 	}
 
-	attachments, err := a.Client.GetAttachmentsForPage(pageID)
+	attachments, err := a.Cache.EnsureAttachments(a.Client, cs, pageID)
 	if err != nil {
 		return err
 	}
@@ -686,7 +686,7 @@ func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string,
 		return fmt.Errorf("fetch page %s: %w", pageID, err)
 	}
 
-	attachments, err := a.Client.GetAttachmentsForPage(pageID)
+	attachments, err := a.Cache.EnsureAttachments(a.Client, cs, pageID)
 	if err != nil {
 		return fmt.Errorf("fetch attachments for page %s: %w", pageID, err)
 	}
@@ -738,7 +738,7 @@ func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string,
 	}
 	fmt.Fprintf(&meta, "modified_by: %s\n", page.Version.AuthorID)
 	if page.Links.WebUI != "" {
-		fmt.Fprintf(&meta, "source: %s%s\n", a.Client.BaseURL, page.Links.WebUI)
+		fmt.Fprintf(&meta, "source: %s/wiki%s\n", a.Client.BaseURL, page.Links.WebUI)
 	}
 	meta.WriteString("---\n\n")
 
@@ -871,8 +871,13 @@ func cleanStaleEntries(root string, written map[string]bool) int {
 		if err != nil {
 			return nil
 		}
-		// Never remove the root directory itself or the sync metadata file.
-		if path == root || filepath.Base(path) == syncMetadataFile {
+		// Never remove the root directory itself, the sync metadata file,
+		// or any git-related files/directories (.git, .gitignore, etc.).
+		base := filepath.Base(path)
+		if path == root || base == syncMetadataFile || strings.HasPrefix(base, ".git") {
+			if info.IsDir() && strings.HasPrefix(base, ".git") {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		entries = append(entries, path)

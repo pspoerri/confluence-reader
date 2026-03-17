@@ -10,7 +10,6 @@ import (
 
 	"github.com/pspoerri/confluence-reader/internal/api"
 	"github.com/pspoerri/confluence-reader/internal/config"
-	"github.com/pspoerri/confluence-reader/internal/progress"
 )
 
 // RenameEntry records an attachment rename for the mirror command.
@@ -98,28 +97,13 @@ func (s *Store) Remove(spaceKey string) error {
 	return nil
 }
 
-// Refresh fetches all pages, attachments, and permissions for a space.
-// This is the most complete (and slowest) cache population method.
+// Refresh fetches all pages and permissions for a space.
+// Attachments are fetched lazily per page when needed.
 func (s *Store) Refresh(client *api.Client, space api.Space) (*CachedSpace, error) {
 	pages, err := client.GetPagesInSpace(space.ID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch pages for space %s: %w", space.Key, err)
 	}
-
-	// Fetch attachment metadata for every page.
-	attachments := make(map[string][]api.Attachment, len(pages))
-	bar := progress.New("Fetching attachments", len(pages))
-	for _, p := range pages {
-		atts, err := client.GetAttachmentsForPage(p.ID)
-		if err != nil {
-			return nil, fmt.Errorf("fetch attachments for page %s: %w", p.ID, err)
-		}
-		if len(atts) > 0 {
-			attachments[p.ID] = atts
-		}
-		bar.Increment()
-	}
-	bar.Finish()
 
 	// Fetch space-level permissions (one call per space).
 	fmt.Fprintf(os.Stderr, "Fetching space permissions...\n")
@@ -129,12 +113,11 @@ func (s *Store) Refresh(client *api.Client, space api.Space) (*CachedSpace, erro
 	}
 
 	cs := &CachedSpace{
-		Space:       space,
-		Pages:       pages,
-		Children:    buildChildrenMap(pages),
-		Attachments: attachments,
-		Operations:  operations,
-		UpdatedAt:   time.Now(),
+		Space:      space,
+		Pages:      pages,
+		Children:   buildChildrenMap(pages),
+		Operations: operations,
+		UpdatedAt:  time.Now(),
 	}
 
 	if err := s.Save(cs); err != nil {

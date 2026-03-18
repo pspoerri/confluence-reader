@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/pspoerri/confluence-reader/internal/cli"
+	"github.com/pspoerri/confluence-reader/internal/ui"
 )
 
 const usage = `confluence-reader - browse Confluence spaces like a filesystem
@@ -61,6 +62,8 @@ func main() {
 		args = args[1:]
 	}
 
+	out := ui.Stderr()
+
 	if len(args) < 1 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(1)
@@ -75,16 +78,16 @@ func main() {
 		fmt.Fprint(os.Stdout, usage)
 		return
 	case "configure":
-		if err := cli.RunConfigure(); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		if err := cli.RunConfigure(out); err != nil {
+			out.Errorf("%v", err)
 			os.Exit(1)
 		}
 		return
 	}
 
-	app, err := cli.NewApp(verbose)
+	app, err := cli.NewApp(verbose, out)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		out.Errorf("%v", err)
 		os.Exit(1)
 	}
 
@@ -184,7 +187,7 @@ func main() {
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		out.Errorf("%v", err)
 		os.Exit(1)
 	}
 }

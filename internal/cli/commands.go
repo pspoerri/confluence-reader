@@ -17,16 +17,18 @@ import (
 	"github.com/pspoerri/confluence-reader/internal/config"
 	"github.com/pspoerri/confluence-reader/internal/convert"
 	"github.com/pspoerri/confluence-reader/internal/progress"
+	"github.com/pspoerri/confluence-reader/internal/ui"
 )
 
 // App holds the shared state for all CLI commands.
 type App struct {
 	Client *api.Client
 	Cache  *cache.Store
+	UI     *ui.Writer
 }
 
 // NewApp creates a new App from the config file.
-func NewApp(verbose bool) (*App, error) {
+func NewApp(verbose bool, out *ui.Writer) (*App, error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return nil, err
@@ -34,12 +36,12 @@ func NewApp(verbose bool) (*App, error) {
 
 	client := api.NewClient(cfg.BaseURL, cfg.Email, cfg.APIToken)
 	client.Verbose = verbose
-	store, err := cache.NewStore()
+	store, err := cache.NewStore(out)
 	if err != nil {
 		return nil, err
 	}
 
-	return &App{Client: client, Cache: store}, nil
+	return &App{Client: client, Cache: store, UI: out}, nil
 }
 
 // RunSpaces lists all accessible spaces.
@@ -82,7 +84,7 @@ func (a *App) resolveSpace(spaceKey string) (*api.Space, error) {
 // ensureSpace loads or creates the cache, optionally forcing a full refresh.
 func (a *App) ensureSpace(space *api.Space, refresh bool) (*cache.CachedSpace, error) {
 	if refresh {
-		fmt.Fprintf(os.Stderr, "Refreshing cache for space %s (%s)...\n", space.Key, space.Name)
+		a.UI.Infof("Refreshing cache for space %s (%s)...", space.Key, space.Name)
 		return a.Cache.Refresh(a.Client, *space)
 	}
 	return a.Cache.EnsureSpace(a.Client, *space)
@@ -91,7 +93,7 @@ func (a *App) ensureSpace(space *api.Space, refresh bool) (*cache.CachedSpace, e
 // ensureLoaded loads a fully populated cache, optionally forcing a refresh.
 func (a *App) ensureLoaded(space *api.Space, refresh bool) (*cache.CachedSpace, error) {
 	if refresh {
-		fmt.Fprintf(os.Stderr, "Refreshing cache for space %s (%s)...\n", space.Key, space.Name)
+		a.UI.Infof("Refreshing cache for space %s (%s)...", space.Key, space.Name)
 		return a.Cache.Refresh(a.Client, *space)
 	}
 	return a.Cache.EnsureLoaded(a.Client, *space)
@@ -206,7 +208,7 @@ func (a *App) RunLs(spaceKey, target string, longFormat, allFiles, refresh bool)
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", e.Perms, e.Name, e.Modified, e.Creator)
 		}
 		w.Flush()
-		fmt.Fprintf(os.Stderr, "\n%d items\n", len(entries))
+		a.UI.Infof("\n%d items", len(entries))
 	} else {
 		for _, e := range entries {
 			fmt.Println(e.Name)
@@ -457,7 +459,7 @@ func (a *App) RunRead(spaceKey, target string, refresh bool) error {
 
 	result := convert.ToMarkdown(body, attachments)
 	if len(result.UnknownTags) > 0 {
-		fmt.Fprintf(os.Stderr, "warning: unhandled tags: %s\n", strings.Join(result.UnknownTags, ", "))
+		a.UI.Warnf("unhandled tags: %s", strings.Join(result.UnknownTags, ", "))
 	}
 
 	// Print header.
@@ -525,9 +527,9 @@ func (a *App) RunReadFile(spaceKey, target, filename string, refresh bool) error
 	defer resp.Body.Close()
 
 	contentType := resp.Header.Get("Content-Type")
-	fmt.Fprintf(os.Stderr, "Content-Type: %s\n", contentType)
-	fmt.Fprintf(os.Stderr, "Filename: %s\n", att.Title)
-	fmt.Fprintf(os.Stderr, "Size: %d bytes\n", att.FileSize)
+	a.UI.Infof("Content-Type: %s", contentType)
+	a.UI.Infof("Filename: %s", att.Title)
+	a.UI.Infof("Size: %d bytes", att.FileSize)
 
 	if strings.HasPrefix(contentType, "text/") {
 		_, err = io.Copy(os.Stdout, resp.Body)
@@ -545,7 +547,7 @@ func (a *App) RunReadFile(spaceKey, target, filename string, refresh bool) error
 	if err != nil {
 		return fmt.Errorf("write output file: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "Written to %s (%d bytes)\n", safeName, n)
+	a.UI.Successf("Written to %s (%d bytes)", safeName, n)
 	return nil
 }
 
@@ -556,14 +558,14 @@ func (a *App) RunRefresh(spaceKey string) error {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "Refreshing cache for space %s (%s)...\n", space.Key, space.Name)
+	a.UI.Infof("Refreshing cache for space %s (%s)...", space.Key, space.Name)
 
 	cs, err := a.Cache.Refresh(a.Client, *space)
 	if err != nil {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "Cached %d pages (at %s)\n", len(cs.Pages), cs.UpdatedAt.Format("2006-01-02 15:04:05"))
+	a.UI.Successf("Cached %d pages (at %s)", len(cs.Pages), cs.UpdatedAt.Format("2006-01-02 15:04:05"))
 	return nil
 }
 
@@ -582,7 +584,7 @@ func (a *App) RunMirror(spaceKey, targetDir string, allFiles, refresh bool) erro
 	}
 
 	if len(cs.Pages) == 0 {
-		fmt.Fprintf(os.Stderr, "No pages in space %s.\n", spaceKey)
+		a.UI.Infof("No pages in space %s.", spaceKey)
 		return nil
 	}
 
@@ -646,7 +648,7 @@ func (a *App) RunMirror(spaceKey, targetDir string, allFiles, refresh bool) erro
 	// Remove files and directories that no longer exist in the space.
 	removed := cleanStaleEntries(targetDir, written)
 	if removed > 0 {
-		fmt.Fprintf(os.Stderr, "Removed %d stale files/directories\n", removed)
+		a.UI.Infof("Removed %d stale files/directories", removed)
 	}
 
 	// Persist the updated rename map.
@@ -654,7 +656,7 @@ func (a *App) RunMirror(spaceKey, targetDir string, allFiles, refresh bool) erro
 		return fmt.Errorf("save cache: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Mirrored space %s to %s (%d pages)\n", spaceKey, targetDir, total)
+	a.UI.Successf("Mirrored space %s to %s (%d pages)", spaceKey, targetDir, total)
 	return nil
 }
 
@@ -720,7 +722,7 @@ func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string,
 	}
 	result := convert.ToMarkdown(body, attachments)
 	if len(result.UnknownTags) > 0 {
-		fmt.Fprintf(os.Stderr, "warning: unhandled tags in %s: %s\n", page.Title, strings.Join(result.UnknownTags, ", "))
+		a.UI.Warnf("unhandled tags in %s: %s", page.Title, strings.Join(result.UnknownTags, ", "))
 	}
 	md := result.Markdown
 
@@ -962,7 +964,7 @@ func sanitizeName(name string) string {
 }
 
 // RunConfigure interactively prompts for Basic Auth credentials and writes the config file.
-func RunConfigure() error {
+func RunConfigure(out *ui.Writer) error {
 	cfgPath, err := config.Path()
 	if err != nil {
 		return err
@@ -992,7 +994,7 @@ func RunConfigure() error {
 		return err
 	}
 
-	fmt.Fprintf(os.Stderr, "\nConfig saved to %s\n", cfgPath)
+	out.Successf("Config saved to %s", cfgPath)
 	return nil
 }
 

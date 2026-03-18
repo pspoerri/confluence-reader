@@ -10,6 +10,7 @@ import (
 
 	"github.com/pspoerri/confluence-reader/internal/api"
 	"github.com/pspoerri/confluence-reader/internal/config"
+	"github.com/pspoerri/confluence-reader/internal/ui"
 )
 
 // RenameEntry records an attachment rename for the mirror command.
@@ -43,10 +44,11 @@ type PageNode struct {
 // Store manages the local page cache.
 type Store struct {
 	dir string
+	UI  *ui.Writer
 }
 
 // NewStore creates a cache store. Cache files live under ~/.config/confluence-reader/cache/.
-func NewStore() (*Store, error) {
+func NewStore(out *ui.Writer) (*Store, error) {
 	stateDir, err := config.StateDir()
 	if err != nil {
 		return nil, err
@@ -55,7 +57,7 @@ func NewStore() (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create cache dir: %w", err)
 	}
-	return &Store{dir: dir}, nil
+	return &Store{dir: dir, UI: out}, nil
 }
 
 func (s *Store) spaceFile(spaceKey string) string {
@@ -106,7 +108,7 @@ func (s *Store) Refresh(client *api.Client, space api.Space) (*CachedSpace, erro
 	}
 
 	// Fetch space-level permissions (one call per space).
-	fmt.Fprintf(os.Stderr, "Fetching space permissions...\n")
+	s.UI.Infof("Fetching space permissions...")
 	operations, err := client.GetSpaceOperations(space.ID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch space operations for %s: %w", space.Key, err)
@@ -139,7 +141,7 @@ func (s *Store) EnsureSpace(client *api.Client, space api.Space) (*CachedSpace, 
 	}
 
 	// Create minimal cache: space metadata + permissions only.
-	fmt.Fprintf(os.Stderr, "Fetching space permissions...\n")
+	s.UI.Infof("Fetching space permissions...")
 	operations, err := client.GetSpaceOperations(space.ID)
 	if err != nil {
 		return nil, fmt.Errorf("fetch space operations for %s: %w", space.Key, err)
@@ -176,7 +178,7 @@ func (s *Store) EnsureFullTree(client *api.Client, cs *CachedSpace) error {
 		return nil
 	}
 
-	fmt.Fprintf(os.Stderr, "Fetching page tree...\n")
+	s.UI.Infof("Fetching page tree...")
 	pages, err := client.GetPagesInSpace(cs.Space.ID)
 	if err != nil {
 		return fmt.Errorf("fetch pages for space %s: %w", cs.Space.Key, err)

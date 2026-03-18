@@ -457,7 +457,13 @@ func (a *App) RunRead(spaceKey, target string, refresh bool) error {
 		body = page.Body.Storage.Value
 	}
 
-	result := convert.ToMarkdown(body, attachments)
+	resolver := &liveMacroResolver{
+		client: a.Client,
+		store:  a.Cache,
+		cs:     cs,
+		pageID: pageID,
+	}
+	result := convert.ToMarkdown(body, attachments, resolver)
 	if len(result.UnknownTags) > 0 {
 		a.UI.Warnf("unhandled tags: %s", strings.Join(result.UnknownTags, ", "))
 	}
@@ -720,7 +726,13 @@ func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string,
 	if page.Body != nil && page.Body.Storage != nil {
 		body = page.Body.Storage.Value
 	}
-	result := convert.ToMarkdown(body, attachments)
+	resolver := &liveMacroResolver{
+		client: a.Client,
+		store:  a.Cache,
+		cs:     cs,
+		pageID: pageID,
+	}
+	result := convert.ToMarkdown(body, attachments, resolver)
 	if len(result.UnknownTags) > 0 {
 		a.UI.Warnf("unhandled tags in %s: %s", page.Title, strings.Join(result.UnknownTags, ", "))
 	}

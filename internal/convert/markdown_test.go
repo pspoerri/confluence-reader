@@ -10,7 +10,7 @@ import (
 
 // toMarkdown is a test helper that calls ToMarkdown and returns just the markdown string.
 func toMarkdown(input string, attachments []api.Attachment) string {
-	return ToMarkdown(input, attachments).Markdown
+	return ToMarkdown(input, attachments, nil).Markdown
 }
 
 func TestToMarkdown_Headings(t *testing.T) {
@@ -751,7 +751,7 @@ func TestToMarkdown_ReferencedAttachments(t *testing.T) {
 
 func TestToMarkdown_UnknownTagsLogged(t *testing.T) {
 	input := `<p>Hello <custom-widget>content</custom-widget></p>`
-	result := ToMarkdown(input, nil)
+	result := ToMarkdown(input, nil, nil)
 	if len(result.UnknownTags) == 0 {
 		t.Errorf("expected unknown tags to be logged, got none")
 	}
@@ -768,7 +768,7 @@ func TestToMarkdown_UnknownTagsLogged(t *testing.T) {
 
 func TestToMarkdown_UnknownMacroLogged(t *testing.T) {
 	input := `<ac:structured-macro ac:name="somethingcustom"><ac:parameter ac:name="key">val</ac:parameter></ac:structured-macro>`
-	result := ToMarkdown(input, nil)
+	result := ToMarkdown(input, nil, nil)
 	found := false
 	for _, tag := range result.UnknownTags {
 		if tag == "macro:somethingcustom" {
@@ -782,7 +782,7 @@ func TestToMarkdown_UnknownMacroLogged(t *testing.T) {
 
 func TestToMarkdown_KnownTagsNotLogged(t *testing.T) {
 	input := `<p>Simple <strong>bold</strong> text</p>`
-	result := ToMarkdown(input, nil)
+	result := ToMarkdown(input, nil, nil)
 	if len(result.UnknownTags) > 0 {
 		t.Errorf("expected no unknown tags for basic HTML, got: %v", result.UnknownTags)
 	}
@@ -902,7 +902,7 @@ func TestToMarkdown_NewTags(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := ToMarkdown(tt.input, nil)
+			result := ToMarkdown(tt.input, nil, nil)
 			got := strings.TrimSpace(result.Markdown)
 			if got != tt.want {
 				t.Errorf("got %q, want %q", got, tt.want)
@@ -931,5 +931,124 @@ func TestFormatSize(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("formatSize(%d) = %q, want %q", tt.bytes, got, tt.want)
 		}
+	}
+}
+
+// mockResolver implements MacroResolver for testing.
+type mockResolver struct {
+	pageID   string
+	children map[string][]PageInfo
+	pages    map[string]PageInfo // title → PageInfo
+	subTree  map[string][]TreeEntry
+}
+
+func (m *mockResolver) CurrentPageID() string { return m.pageID }
+
+func (m *mockResolver) ChildPages(pageID string) ([]PageInfo, error) {
+	return m.children[pageID], nil
+}
+
+func (m *mockResolver) PageByTitle(title string) *PageInfo {
+	if p, ok := m.pages[title]; ok {
+		return &p
+	}
+	return nil
+}
+
+func (m *mockResolver) SubTree(pageID string) ([]TreeEntry, error) {
+	return m.subTree[pageID], nil
+}
+
+func TestToMarkdown_ChildrenMacro_WithResolver(t *testing.T) {
+	input := `<ac-structured-macro ac-name="children"></ac-structured-macro>`
+	resolver := &mockResolver{
+		pageID: "100",
+		children: map[string][]PageInfo{
+			"100": {
+				{ID: "101", Title: "Child A"},
+				{ID: "102", Title: "Child B"},
+			},
+		},
+	}
+	result := ToMarkdown(input, nil, resolver).Markdown
+	if !strings.Contains(result, "- [Child A](page:Child A)") {
+		t.Errorf("expected Child A link, got: %s", result)
+	}
+	if !strings.Contains(result, "- [Child B](page:Child B)") {
+		t.Errorf("expected Child B link, got: %s", result)
+	}
+}
+
+func TestToMarkdown_ChildrenMacro_NilResolver(t *testing.T) {
+	input := `<ac-structured-macro ac-name="children"></ac-structured-macro>`
+	result := ToMarkdown(input, nil, nil).Markdown
+	if !strings.Contains(result, "*(children)*") {
+		t.Errorf("expected placeholder, got: %s", result)
+	}
+}
+
+func TestToMarkdown_ChildrenMacro_NamedPage(t *testing.T) {
+	input := `<ac-structured-macro ac-name="children"><ac-parameter ac-name="page">Other Page</ac-parameter></ac-structured-macro>`
+	resolver := &mockResolver{
+		pageID: "100",
+		pages:  map[string]PageInfo{"Other Page": {ID: "200", Title: "Other Page"}},
+		children: map[string][]PageInfo{
+			"200": {
+				{ID: "201", Title: "Sub Page"},
+			},
+		},
+	}
+	result := ToMarkdown(input, nil, resolver).Markdown
+	if !strings.Contains(result, "- [Sub Page](page:Sub Page)") {
+		t.Errorf("expected Sub Page link, got: %s", result)
+	}
+}
+
+func TestToMarkdown_PagetreeMacro_WithResolver(t *testing.T) {
+	input := `<ac-structured-macro ac-name="pagetree"></ac-structured-macro>`
+	resolver := &mockResolver{
+		pageID: "100",
+		subTree: map[string][]TreeEntry{
+			"100": {
+				{Page: PageInfo{ID: "101", Title: "Level 0"}, Depth: 0},
+				{Page: PageInfo{ID: "102", Title: "Level 1"}, Depth: 1},
+				{Page: PageInfo{ID: "103", Title: "Level 0 Again"}, Depth: 0},
+			},
+		},
+	}
+	result := ToMarkdown(input, nil, resolver).Markdown
+	if !strings.Contains(result, "- [Level 0](page:Level 0)") {
+		t.Errorf("expected Level 0, got: %s", result)
+	}
+	if !strings.Contains(result, "  - [Level 1](page:Level 1)") {
+		t.Errorf("expected indented Level 1, got: %s", result)
+	}
+	if !strings.Contains(result, "- [Level 0 Again](page:Level 0 Again)") {
+		t.Errorf("expected Level 0 Again, got: %s", result)
+	}
+}
+
+func TestToMarkdown_PagetreeMacro_NilResolver(t *testing.T) {
+	input := `<ac-structured-macro ac-name="pagetree"></ac-structured-macro>`
+	result := ToMarkdown(input, nil, nil).Markdown
+	if !strings.Contains(result, "*(page tree)*") {
+		t.Errorf("expected placeholder, got: %s", result)
+	}
+}
+
+func TestToMarkdown_PagetreeMacro_NamedRoot(t *testing.T) {
+	input := `<ac-structured-macro ac-name="pagetree"><ac-parameter ac-name="root">Root Page</ac-parameter></ac-structured-macro>`
+	resolver := &mockResolver{
+		pageID: "100",
+		pages:  map[string]PageInfo{"Root Page": {ID: "300", Title: "Root Page"}},
+		subTree: map[string][]TreeEntry{
+			"300": {
+				{Page: PageInfo{ID: "301", Title: "Tree Child"}, Depth: 0},
+			},
+		},
+	}
+	result := ToMarkdown(input, nil, resolver).Markdown
+	if !strings.Contains(result, "- [Tree Child](page:Tree Child)") {
+		t.Errorf("expected Tree Child link, got: %s", result)
 	}
 }

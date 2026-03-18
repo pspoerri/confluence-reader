@@ -18,8 +18,9 @@ type Result struct {
 
 // ToMarkdown converts Confluence storage format HTML into Markdown.
 // Attachment references are rewritten to [filename](attachment:filename).
-func ToMarkdown(storageHTML string, attachments []api.Attachment) Result {
-	c := &converter{}
+// If resolver is non-nil, children and pagetree macros are expanded with real data.
+func ToMarkdown(storageHTML string, attachments []api.Attachment, resolver MacroResolver) Result {
+	c := &converter{resolver: resolver}
 	s := c.convert(storageHTML)
 
 	// Append attachment list at the end if any exist.
@@ -89,6 +90,7 @@ type converter struct {
 	buf       strings.Builder
 	listDepth int
 	unknown   map[string]struct{} // unhandled tags seen during conversion
+	resolver  MacroResolver       // optional resolver for children/pagetree macros
 }
 
 // logUnknown records a tag name as unhandled.
@@ -466,6 +468,9 @@ func (c *converter) renderMacro(n *node) {
 		// Drop silently — dynamic widgets with no static content.
 
 	case "children":
+		if rendered := c.renderChildrenMacro(n); rendered {
+			break
+		}
 		page := macroParam(n, "page")
 		if page != "" {
 			c.buf.WriteString(fmt.Sprintf("\n*(children of [%s](page:%s))*\n", page, page))
@@ -493,6 +498,9 @@ func (c *converter) renderMacro(n *node) {
 		c.buf.WriteString("*(labels)*")
 
 	case "pagetree":
+		if rendered := c.renderPagetreeMacro(n); rendered {
+			break
+		}
 		root := macroParam(n, "root")
 		if root != "" {
 			c.buf.WriteString(fmt.Sprintf("\n*(page tree: [%s](page:%s))*\n", root, root))
@@ -552,6 +560,63 @@ func (c *converter) renderMacro(n *node) {
 			c.logUnknown("macro:" + name)
 		}
 	}
+}
+
+// renderChildrenMacro expands the children macro using the resolver.
+// Returns true if it rendered successfully, false to fall back to placeholder.
+func (c *converter) renderChildrenMacro(n *node) bool {
+	if c.resolver == nil {
+		return false
+	}
+	pageParam := macroParam(n, "page")
+	var pageID string
+	if pageParam != "" {
+		info := c.resolver.PageByTitle(pageParam)
+		if info == nil {
+			return false
+		}
+		pageID = info.ID
+	} else {
+		pageID = c.resolver.CurrentPageID()
+	}
+	children, err := c.resolver.ChildPages(pageID)
+	if err != nil || len(children) == 0 {
+		return false
+	}
+	c.buf.WriteString("\n")
+	for _, child := range children {
+		c.buf.WriteString(fmt.Sprintf("- [%s](page:%s)\n", child.Title, child.Title))
+	}
+	return true
+}
+
+// renderPagetreeMacro expands the pagetree macro using the resolver.
+// Returns true if it rendered successfully, false to fall back to placeholder.
+func (c *converter) renderPagetreeMacro(n *node) bool {
+	if c.resolver == nil {
+		return false
+	}
+	rootParam := macroParam(n, "root")
+	var rootID string
+	if rootParam != "" {
+		info := c.resolver.PageByTitle(rootParam)
+		if info == nil {
+			return false
+		}
+		rootID = info.ID
+	} else {
+		rootID = c.resolver.CurrentPageID()
+	}
+	entries, err := c.resolver.SubTree(rootID)
+	if err != nil || len(entries) == 0 {
+		return false
+	}
+	c.buf.WriteString("\n")
+	for _, e := range entries {
+		indent := strings.Repeat("  ", e.Depth)
+		c.buf.WriteString(fmt.Sprintf("%s- [%s](page:%s)\n", indent, e.Page.Title, e.Page.Title))
+	}
+	return true
 }
 
 // renderMacroBody finds the ac-rich-text-body child and renders its contents.

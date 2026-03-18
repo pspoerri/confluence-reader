@@ -310,8 +310,8 @@ func TestToMarkdown_InfoPanel(t *testing.T) {
 	input := `<ac:structured-macro ac:name="info"><ac:rich-text-body><p>This is important information.</p></ac:rich-text-body></ac:structured-macro>`
 	result := toMarkdown(input, nil)
 
-	if !strings.Contains(result, "> **Info:**") {
-		t.Errorf("expected info callout, got: %s", result)
+	if !strings.Contains(result, "> [!NOTE]") {
+		t.Errorf("expected NOTE alert, got: %s", result)
 	}
 	if !strings.Contains(result, "This is important information.") {
 		t.Errorf("expected info content, got: %s", result)
@@ -322,8 +322,102 @@ func TestToMarkdown_WarningPanel(t *testing.T) {
 	input := `<ac:structured-macro ac:name="warning"><ac:rich-text-body><p>Be careful!</p></ac:rich-text-body></ac:structured-macro>`
 	result := toMarkdown(input, nil)
 
-	if !strings.Contains(result, "> **Warning:**") {
-		t.Errorf("expected warning callout, got: %s", result)
+	if !strings.Contains(result, "> [!WARNING]") {
+		t.Errorf("expected WARNING alert, got: %s", result)
+	}
+}
+
+func TestToMarkdown_ErrorPanel(t *testing.T) {
+	input := `<ac:structured-macro ac:name="error"><ac:rich-text-body><p>Something failed.</p></ac:rich-text-body></ac:structured-macro>`
+	result := toMarkdown(input, nil)
+
+	if !strings.Contains(result, "> [!CAUTION]") {
+		t.Errorf("expected CAUTION alert, got: %s", result)
+	}
+	if !strings.Contains(result, "Something failed.") {
+		t.Errorf("expected error content, got: %s", result)
+	}
+}
+
+func TestToMarkdown_SuccessPanel(t *testing.T) {
+	input := `<ac:structured-macro ac:name="success"><ac:rich-text-body><p>All good!</p></ac:rich-text-body></ac:structured-macro>`
+	result := toMarkdown(input, nil)
+
+	if !strings.Contains(result, "> [!NOTE]") {
+		t.Errorf("expected NOTE alert for success panel, got: %s", result)
+	}
+	if !strings.Contains(result, "All good!") {
+		t.Errorf("expected success content, got: %s", result)
+	}
+}
+
+func TestToMarkdown_DecisionPanel(t *testing.T) {
+	input := `<ac:structured-macro ac:name="decision"><ac:rich-text-body><p>We decided X.</p></ac:rich-text-body></ac:structured-macro>`
+	result := toMarkdown(input, nil)
+
+	if !strings.Contains(result, "> [!IMPORTANT]") {
+		t.Errorf("expected IMPORTANT alert for decision panel, got: %s", result)
+	}
+	if !strings.Contains(result, "We decided X.") {
+		t.Errorf("expected decision content, got: %s", result)
+	}
+}
+
+func TestToMarkdown_NotePanel(t *testing.T) {
+	input := `<ac:structured-macro ac:name="note"><ac:rich-text-body><p>Take note of this.</p></ac:rich-text-body></ac:structured-macro>`
+	result := toMarkdown(input, nil)
+
+	if !strings.Contains(result, "> [!NOTE]") {
+		t.Errorf("expected NOTE alert, got: %s", result)
+	}
+	if !strings.Contains(result, "Take note of this.") {
+		t.Errorf("expected note content, got: %s", result)
+	}
+}
+
+func TestToMarkdown_TipPanel(t *testing.T) {
+	input := `<ac:structured-macro ac:name="tip"><ac:rich-text-body><p>Here is a tip.</p></ac:rich-text-body></ac:structured-macro>`
+	result := toMarkdown(input, nil)
+
+	if !strings.Contains(result, "> [!TIP]") {
+		t.Errorf("expected TIP alert, got: %s", result)
+	}
+	if !strings.Contains(result, "Here is a tip.") {
+		t.Errorf("expected tip content, got: %s", result)
+	}
+}
+
+func TestToMarkdown_PanelWithTitle(t *testing.T) {
+	input := `<ac:structured-macro ac:name="warning"><ac:parameter ac:name="title">Watch Out</ac:parameter><ac:rich-text-body><p>Danger ahead.</p></ac:rich-text-body></ac:structured-macro>`
+	result := toMarkdown(input, nil)
+
+	if !strings.Contains(result, "> [!WARNING]") {
+		t.Errorf("expected WARNING alert, got: %s", result)
+	}
+	if !strings.Contains(result, "> **Watch Out**") {
+		t.Errorf("expected title line, got: %s", result)
+	}
+	if !strings.Contains(result, "Danger ahead.") {
+		t.Errorf("expected panel content, got: %s", result)
+	}
+}
+
+func TestToMarkdown_PanelMultiLine(t *testing.T) {
+	input := `<ac:structured-macro ac:name="info"><ac:rich-text-body><p>Line one</p><p>Line two</p></ac:rich-text-body></ac:structured-macro>`
+	result := toMarkdown(input, nil)
+
+	if !strings.Contains(result, "> [!NOTE]") {
+		t.Errorf("expected NOTE alert, got: %s", result)
+	}
+	// Each content line should be prefixed with "> "
+	for _, line := range strings.Split(result, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if !strings.HasPrefix(trimmed, ">") {
+			t.Errorf("expected all non-empty lines to start with '>', got line: %q", line)
+		}
 	}
 }
 

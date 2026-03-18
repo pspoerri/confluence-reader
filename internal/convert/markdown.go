@@ -48,11 +48,11 @@ var emoticonMap = map[string]string{
 	"heart": "(heart)", "broken-heart": "(broken-heart)",
 }
 
-// panelNames maps Confluence panel macro names to their display labels.
-var panelNames = map[string]string{
-	"info": "Info", "note": "Note", "warning": "Warning",
-	"tip": "Tip", "success": "Success", "error": "Error",
-	"decision": "Decision", "expand": "Details",
+// panelAlerts maps Confluence panel macro names to GitHub alert keywords.
+var panelAlerts = map[string]string{
+	"info": "NOTE", "note": "NOTE", "warning": "WARNING",
+	"tip": "TIP", "success": "NOTE", "error": "CAUTION",
+	"decision": "IMPORTANT", "expand": "NOTE",
 }
 
 // nodeKind identifies the type of a parsed XML node.
@@ -537,15 +537,17 @@ func (c *converter) renderMacro(n *node) {
 		c.buf.WriteString(inner)
 
 	default:
-		// Named panels (info, note, warning, tip, etc.)
-		if label, ok := panelNames[name]; ok {
+		// Named panels (info, note, warning, tip, etc.) → GitHub alerts.
+		if alert, ok := panelAlerts[name]; ok {
 			title := macroParam(n, "title")
 			inner := c.renderMacroBody(n)
-			header := label
+			c.buf.WriteString(fmt.Sprintf("\n> [!%s]\n", alert))
 			if title != "" {
-				header = label + ": " + title
+				c.buf.WriteString(fmt.Sprintf("> **%s**\n>\n", title))
 			}
-			c.buf.WriteString(fmt.Sprintf("\n> **%s:**\n> %s\n", header, inner))
+			for _, line := range strings.Split(inner, "\n") {
+				c.buf.WriteString("> " + line + "\n")
+			}
 		} else {
 			c.logUnknown("macro:" + name)
 		}

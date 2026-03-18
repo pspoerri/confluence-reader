@@ -770,6 +770,41 @@ func TestToMarkdown_NewTags(t *testing.T) {
 			input: `<ac:structured-macro ac:name="details"><ac:rich-text-body><p>Detail content</p></ac:rich-text-body></ac:structured-macro>`,
 			want:  "Detail content",
 		},
+		{
+			name:  "drawio-sketch macro",
+			input: `<ac:structured-macro ac:name="drawio-sketch"><ac:parameter ac:name="diagramName">sketch1</ac:parameter></ac:structured-macro>`,
+			want:  "*(diagram: sketch1)*",
+		},
+		{
+			name:  "pagetree macro with root",
+			input: `<ac:structured-macro ac:name="pagetree"><ac:parameter ac:name="root">Engineering</ac:parameter></ac:structured-macro>`,
+			want:  "*(page tree: [Engineering](page:Engineering))*",
+		},
+		{
+			name:  "pagetree macro without root",
+			input: `<ac:structured-macro ac:name="pagetree"></ac:structured-macro>`,
+			want:  "*(page tree)*",
+		},
+		{
+			name:  "attachments macro",
+			input: `<ac:structured-macro ac:name="attachments"></ac:structured-macro>`,
+			want:  "*(attachments)*",
+		},
+		{
+			name:  "tasks-report-macro dropped",
+			input: `<p>Before</p><ac:structured-macro ac:name="tasks-report-macro"></ac:structured-macro><p>After</p>`,
+			want:  "Before\n\nAfter",
+		},
+		{
+			name:  "contentbylabel with label",
+			input: `<ac:structured-macro ac:name="contentbylabel"><ac:parameter ac:name="label">architecture</ac:parameter></ac:structured-macro>`,
+			want:  "*(content by label: architecture)*",
+		},
+		{
+			name:  "ac-placeholder pass-through",
+			input: `<p>Some <ac:placeholder>placeholder</ac:placeholder> text</p>`,
+			want:  "Some placeholder text",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

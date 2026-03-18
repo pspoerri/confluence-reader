@@ -390,7 +390,7 @@ func (c *converter) renderElement(n *node) bool {
 		"ac-task", "ac-task-status", "ac-task-body",
 		"ac-layout", "ac-layout-section", "ac-layout-cell",
 		"ac-link-body", "ac-adf-extension", "ac-adf-fallback",
-		"ac-inline-comment-marker",
+		"ac-inline-comment-marker", "ac-placeholder", "ac-macro",
 		"ri-attachment", "ri-user", "ri-page", "ri-space",
 		"img", "figure", "figcaption", "section", "article",
 		"nav", "header", "footer", "main", "aside":
@@ -461,7 +461,8 @@ func (c *converter) renderMacro(n *node) {
 
 	case "anchor", "toc",
 		"livesearch", "miro-macro-resizing",
-		"profile-picture", "recently-updated":
+		"profile-picture", "recently-updated",
+		"tasks-report-macro":
 		// Drop silently — dynamic widgets with no static content.
 
 	case "children":
@@ -491,13 +492,35 @@ func (c *converter) renderMacro(n *node) {
 	case "listlabels":
 		c.buf.WriteString("*(labels)*")
 
+	case "pagetree":
+		root := macroParam(n, "root")
+		if root != "" {
+			c.buf.WriteString(fmt.Sprintf("\n*(page tree: [%s](page:%s))*\n", root, root))
+		} else {
+			c.buf.WriteString("\n*(page tree)*\n")
+		}
+
+	case "attachments":
+		c.buf.WriteString("\n*(attachments)*\n")
+
+	case "contentbylabel":
+		labels := macroParam(n, "cql")
+		if labels == "" {
+			labels = macroParam(n, "label")
+		}
+		if labels != "" {
+			c.buf.WriteString(fmt.Sprintf("\n*(content by label: %s)*\n", labels))
+		} else {
+			c.buf.WriteString("\n*(content by label)*\n")
+		}
+
 	case "view-file", "viewpdf":
 		name := macroParam(n, "name")
 		if name != "" {
 			c.buf.WriteString(fmt.Sprintf("[%s](attachment:%s)", name, name))
 		}
 
-	case "drawio", "inc-drawio":
+	case "drawio", "inc-drawio", "drawio-sketch":
 		name := macroParam(n, "diagramName")
 		if name != "" {
 			c.buf.WriteString(fmt.Sprintf("*(diagram: %s)*", name))

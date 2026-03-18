@@ -455,12 +455,15 @@ func (a *App) RunRead(spaceKey, target string, refresh bool) error {
 		body = page.Body.Storage.Value
 	}
 
-	md := convert.ToMarkdown(body, attachments)
+	result := convert.ToMarkdown(body, attachments)
+	if len(result.UnknownTags) > 0 {
+		fmt.Fprintf(os.Stderr, "warning: unhandled tags: %s\n", strings.Join(result.UnknownTags, ", "))
+	}
 
 	// Print header.
 	fmt.Printf("# %s\n\n", page.Title)
 	fmt.Printf("> Page ID: %s | Version: %d | Updated: %s\n\n", page.ID, page.Version.Number, page.Version.CreatedAt)
-	fmt.Println(md)
+	fmt.Println(result.Markdown)
 
 	return nil
 }
@@ -715,7 +718,11 @@ func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string,
 	if page.Body != nil && page.Body.Storage != nil {
 		body = page.Body.Storage.Value
 	}
-	md := convert.ToMarkdown(body, attachments)
+	result := convert.ToMarkdown(body, attachments)
+	if len(result.UnknownTags) > 0 {
+		fmt.Fprintf(os.Stderr, "warning: unhandled tags in %s: %s\n", page.Title, strings.Join(result.UnknownTags, ", "))
+	}
+	md := result.Markdown
 
 	// Rewrite attachment:filename references to renamed local filenames.
 	for origName, newName := range renameMap {

@@ -10,9 +10,15 @@ import (
 	"github.com/pspoerri/confluence-reader/internal/api"
 )
 
+// Result holds the output of a Confluence-to-Markdown conversion.
+type Result struct {
+	Markdown    string
+	UnknownTags []string // unhandled HTML/XML tags encountered during conversion
+}
+
 // ToMarkdown converts Confluence storage format HTML into Markdown.
 // Attachment references are rewritten to [filename](attachment:filename).
-func ToMarkdown(storageHTML string, attachments []api.Attachment) string {
+func ToMarkdown(storageHTML string, attachments []api.Attachment) Result {
 	c := &converter{}
 	s := c.convert(storageHTML)
 
@@ -24,7 +30,10 @@ func ToMarkdown(storageHTML string, attachments []api.Attachment) string {
 		}
 	}
 
-	return strings.TrimSpace(s)
+	return Result{
+		Markdown:    strings.TrimSpace(s),
+		UnknownTags: c.unknownTags(),
+	}
 }
 
 // emoticonMap maps Confluence emoticon names to text representations.
@@ -79,6 +88,35 @@ func (n *node) appendChild(child *node) {
 type converter struct {
 	buf       strings.Builder
 	listDepth int
+	unknown   map[string]struct{} // unhandled tags seen during conversion
+}
+
+// logUnknown records a tag name as unhandled.
+func (c *converter) logUnknown(tag string) {
+	if c.unknown == nil {
+		c.unknown = make(map[string]struct{})
+	}
+	c.unknown[tag] = struct{}{}
+}
+
+// unknownTags returns a sorted list of unhandled tag names.
+func (c *converter) unknownTags() []string {
+	if len(c.unknown) == 0 {
+		return nil
+	}
+	tags := make([]string, 0, len(c.unknown))
+	for tag := range c.unknown {
+		tags = append(tags, tag)
+	}
+	// Sort is not critical but makes output deterministic.
+	for i := range tags {
+		for j := i + 1; j < len(tags); j++ {
+			if tags[i] > tags[j] {
+				tags[i], tags[j] = tags[j], tags[i]
+			}
+		}
+	}
+	return tags
 }
 
 // rewriteNamespaces rewrites Confluence XML namespace prefixes (ac:, ri:)
@@ -334,7 +372,22 @@ func (c *converter) renderElement(n *node) bool {
 		return true
 	}
 
-	return false // unknown or structural tag — render children
+	// Log truly unknown tags. Skip known structural/pass-through elements.
+	switch n.data {
+	case "div", "span", "li",
+		"thead", "tbody", "tfoot", "tr", "th", "td",
+		"colgroup", "col",
+		"html", "head", "body",
+		"ac-parameter", "ac-rich-text-body", "ac-plain-text-body",
+		"ac-task", "ac-task-status", "ac-task-body",
+		"ri-attachment", "ri-user", "ri-page",
+		"img", "figure", "figcaption", "section", "article",
+		"nav", "header", "footer", "main", "aside":
+		// Known pass-through or internally handled — don't log.
+	default:
+		c.logUnknown(n.data)
+	}
+	return false
 }
 
 // renderChildren renders all child nodes of n.
@@ -408,8 +461,9 @@ func (c *converter) renderMacro(n *node) {
 				header = label + ": " + title
 			}
 			c.buf.WriteString(fmt.Sprintf("\n> **%s:**\n> %s\n", header, inner))
+		} else {
+			c.logUnknown("macro:" + name)
 		}
-		// Unknown macros: silently drop.
 	}
 }
 

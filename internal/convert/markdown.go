@@ -277,6 +277,14 @@ func (c *converter) renderElement(n *node) bool {
 			c.buf.WriteString("(" + name + ")")
 		}
 		return true
+	case "ac-adf-node", "ac-adf-attribute", "ac-adf-content":
+		// ADF internals — the ac-adf-fallback sibling has the readable content.
+		return true
+	case "time":
+		if dt := attr(n, "datetime"); dt != "" {
+			c.buf.WriteString(dt)
+		}
+		return true
 
 	// --- Block elements ---
 
@@ -380,7 +388,10 @@ func (c *converter) renderElement(n *node) bool {
 		"html", "head", "body",
 		"ac-parameter", "ac-rich-text-body", "ac-plain-text-body",
 		"ac-task", "ac-task-status", "ac-task-body",
-		"ri-attachment", "ri-user", "ri-page",
+		"ac-layout", "ac-layout-section", "ac-layout-cell",
+		"ac-link-body", "ac-adf-extension", "ac-adf-fallback",
+		"ac-inline-comment-marker",
+		"ri-attachment", "ri-user", "ri-page", "ri-space",
 		"img", "figure", "figcaption", "section", "article",
 		"nav", "header", "footer", "main", "aside":
 		// Known pass-through or internally handled — don't log.
@@ -448,8 +459,59 @@ func (c *converter) renderMacro(n *node) {
 		key := macroParam(n, "key")
 		c.buf.WriteString("`" + key + "`")
 
-	case "anchor", "toc":
-		// Drop silently.
+	case "anchor", "toc",
+		"livesearch", "miro-macro-resizing",
+		"profile-picture", "recently-updated":
+		// Drop silently — dynamic widgets with no static content.
+
+	case "children":
+		page := macroParam(n, "page")
+		if page != "" {
+			c.buf.WriteString(fmt.Sprintf("\n*(children of [%s](page:%s))*\n", page, page))
+		} else {
+			c.buf.WriteString("\n*(children)*\n")
+		}
+
+	case "content-report-table":
+		labels := macroParam(n, "labels")
+		if labels != "" {
+			c.buf.WriteString(fmt.Sprintf("\n*(content report: %s)*\n", labels))
+		} else {
+			c.buf.WriteString("\n*(content report)*\n")
+		}
+
+	case "decisionreport":
+		label := macroParam(n, "label")
+		if label != "" {
+			c.buf.WriteString(fmt.Sprintf("\n*(decision report: %s)*\n", label))
+		} else {
+			c.buf.WriteString("\n*(decision report)*\n")
+		}
+
+	case "listlabels":
+		c.buf.WriteString("*(labels)*")
+
+	case "view-file", "viewpdf":
+		name := macroParam(n, "name")
+		if name != "" {
+			c.buf.WriteString(fmt.Sprintf("[%s](attachment:%s)", name, name))
+		}
+
+	case "drawio", "inc-drawio":
+		name := macroParam(n, "diagramName")
+		if name != "" {
+			c.buf.WriteString(fmt.Sprintf("*(diagram: %s)*", name))
+		} else {
+			c.buf.WriteString("*(diagram)*")
+		}
+
+	case "details":
+		inner := c.renderMacroBody(n)
+		c.buf.WriteString(inner)
+
+	case "detailssummary":
+		inner := c.renderMacroBody(n)
+		c.buf.WriteString(inner)
 
 	default:
 		// Named panels (info, note, warning, tip, etc.)

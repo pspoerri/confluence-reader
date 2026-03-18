@@ -673,16 +673,16 @@ func TestToMarkdown_UnknownTagsLogged(t *testing.T) {
 }
 
 func TestToMarkdown_UnknownMacroLogged(t *testing.T) {
-	input := `<ac:structured-macro ac:name="drawio"><ac:parameter ac:name="name">diagram1</ac:parameter></ac:structured-macro>`
+	input := `<ac:structured-macro ac:name="somethingcustom"><ac:parameter ac:name="key">val</ac:parameter></ac:structured-macro>`
 	result := ToMarkdown(input, nil)
 	found := false
 	for _, tag := range result.UnknownTags {
-		if tag == "macro:drawio" {
+		if tag == "macro:somethingcustom" {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("expected macro:drawio in unknown tags, got: %v", result.UnknownTags)
+		t.Errorf("expected macro:somethingcustom in unknown tags, got: %v", result.UnknownTags)
 	}
 }
 
@@ -691,6 +691,97 @@ func TestToMarkdown_KnownTagsNotLogged(t *testing.T) {
 	result := ToMarkdown(input, nil)
 	if len(result.UnknownTags) > 0 {
 		t.Errorf("expected no unknown tags for basic HTML, got: %v", result.UnknownTags)
+	}
+}
+
+func TestToMarkdown_NewTags(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "time element",
+			input: `<p>Due <time datetime="2024-03-15" /></p>`,
+			want:  "Due 2024-03-15",
+		},
+		{
+			name:  "layout pass-through",
+			input: `<ac:layout><ac:layout-section ac:type="two_equal"><ac:layout-cell><p>Left</p></ac:layout-cell><ac:layout-cell><p>Right</p></ac:layout-cell></ac:layout-section></ac:layout>`,
+			want:  "Left\n\nRight",
+		},
+		{
+			name:  "drawio macro with name",
+			input: `<ac:structured-macro ac:name="drawio"><ac:parameter ac:name="diagramName">arch</ac:parameter></ac:structured-macro>`,
+			want:  "*(diagram: arch)*",
+		},
+		{
+			name:  "drawio macro without name",
+			input: `<ac:structured-macro ac:name="drawio"></ac:structured-macro>`,
+			want:  "*(diagram)*",
+		},
+		{
+			name:  "view-file macro",
+			input: `<ac:structured-macro ac:name="view-file"><ac:parameter ac:name="name">report.xlsx</ac:parameter></ac:structured-macro>`,
+			want:  "[report.xlsx](attachment:report.xlsx)",
+		},
+		{
+			name:  "viewpdf macro",
+			input: `<ac:structured-macro ac:name="viewpdf"><ac:parameter ac:name="name">spec.pdf</ac:parameter></ac:structured-macro>`,
+			want:  "[spec.pdf](attachment:spec.pdf)",
+		},
+		{
+			name:  "ADF fallback rendered",
+			input: `<ac:adf-extension><ac:adf-node type="extension"><ac:adf-attribute key="type">com.example</ac:adf-attribute></ac:adf-node><ac:adf-fallback><p>Fallback text</p></ac:adf-fallback></ac:adf-extension>`,
+			want:  "Fallback text",
+		},
+		{
+			name:  "inline comment marker pass-through",
+			input: `<p>Some <ac:inline-comment-marker ac:ref="abc">commented</ac:inline-comment-marker> text</p>`,
+			want:  "Some commented text",
+		},
+		{
+			name:  "children macro without page",
+			input: `<p>Above</p><ac:structured-macro ac:name="children"></ac:structured-macro><p>Below</p>`,
+			want:  "Above\n\n*(children)*\nBelow",
+		},
+		{
+			name:  "children macro with page",
+			input: `<ac:structured-macro ac:name="children"><ac:parameter ac:name="page">Parent Page</ac:parameter></ac:structured-macro>`,
+			want:  "*(children of [Parent Page](page:Parent Page))*",
+		},
+		{
+			name:  "content-report-table with labels",
+			input: `<ac:structured-macro ac:name="content-report-table"><ac:parameter ac:name="labels">roadmap,q1</ac:parameter></ac:structured-macro>`,
+			want:  "*(content report: roadmap,q1)*",
+		},
+		{
+			name:  "decisionreport with label",
+			input: `<ac:structured-macro ac:name="decisionreport"><ac:parameter ac:name="label">team-decisions</ac:parameter></ac:structured-macro>`,
+			want:  "*(decision report: team-decisions)*",
+		},
+		{
+			name:  "listlabels macro",
+			input: `<ac:structured-macro ac:name="listlabels"></ac:structured-macro>`,
+			want:  "*(labels)*",
+		},
+		{
+			name:  "details macro renders body",
+			input: `<ac:structured-macro ac:name="details"><ac:rich-text-body><p>Detail content</p></ac:rich-text-body></ac:structured-macro>`,
+			want:  "Detail content",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := ToMarkdown(tt.input, nil)
+			got := strings.TrimSpace(result.Markdown)
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+			if len(result.UnknownTags) > 0 {
+				t.Errorf("unexpected unknown tags: %v", result.UnknownTags)
+			}
+		})
 	}
 }
 

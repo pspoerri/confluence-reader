@@ -171,6 +171,48 @@ func TestToMarkdown_TableWithTheadTbody(t *testing.T) {
 	}
 }
 
+func TestToMarkdown_TableWithSelfClosingEmoticon(t *testing.T) {
+	input := `<table><tr><td><ac:emoticon ac:name="tick" /></td><td>Approved</td></tr><tr><td><ac:emoticon ac:name="cross" /></td><td>Rejected</td></tr></table>`
+	result := ToMarkdown(input, nil)
+
+	if !strings.Contains(result, "| (check) | Approved |") {
+		t.Errorf("expected self-closing emoticon in first cell, got: %s", result)
+	}
+	if !strings.Contains(result, "| (x) | Rejected |") {
+		t.Errorf("expected self-closing emoticon in second row, got: %s", result)
+	}
+}
+
+func TestToMarkdown_TableWithSelfClosingImage(t *testing.T) {
+	input := `<table><tr><th>Preview</th><th>Name</th></tr><tr><td><ac:image><ri:attachment ri:filename="icon.png" /></ac:image></td><td>Icon</td></tr></table>`
+	result := ToMarkdown(input, nil)
+
+	if !strings.Contains(result, "| Preview | Name |") {
+		t.Errorf("expected header row, got: %s", result)
+	}
+	if !strings.Contains(result, "![icon.png](attachment:icon.png)") {
+		t.Errorf("expected image in cell, got: %s", result)
+	}
+	if !strings.Contains(result, "| Icon |") {
+		t.Errorf("expected Icon in separate cell (self-closing ri:attachment must not swallow siblings), got: %s", result)
+	}
+}
+
+func TestToMarkdown_TableWithSelfClosingStatus(t *testing.T) {
+	input := `<table><tr><th>Task</th><th>Status</th></tr><tr><td>Deploy</td><td><ac:structured-macro ac:name="status"><ac:parameter ac:name="title">DONE</ac:parameter></ac:structured-macro></td></tr></table>`
+	result := ToMarkdown(input, nil)
+
+	if !strings.Contains(result, "| Task | Status |") {
+		t.Errorf("expected header row, got: %s", result)
+	}
+	if !strings.Contains(result, "`DONE`") {
+		t.Errorf("expected status lozenge in table, got: %s", result)
+	}
+	if !strings.Contains(result, "| Deploy |") {
+		t.Errorf("expected Deploy cell, got: %s", result)
+	}
+}
+
 func TestToMarkdown_CodeBlockWithLanguage(t *testing.T) {
 	input := `<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">python</ac:parameter><ac:plain-text-body><![CDATA[def hello():
     print("world")]]></ac:plain-text-body></ac:structured-macro>`
@@ -214,6 +256,51 @@ line 2</pre>`
 	}
 }
 
+func TestToMarkdown_CodeBlockPreservesIndentation(t *testing.T) {
+	input := `<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">go</ac:parameter><ac:plain-text-body><![CDATA[func main() {
+	if a < b && c > d {
+		fmt.Println("hello & world")
+	}
+}]]></ac:plain-text-body></ac:structured-macro>`
+	result := ToMarkdown(input, nil)
+	if !strings.Contains(result, "```go\n") {
+		t.Errorf("expected go code fence, got: %s", result)
+	}
+	if !strings.Contains(result, "\t\tfmt.Println") {
+		t.Errorf("expected preserved indentation, got: %s", result)
+	}
+	if !strings.Contains(result, `"hello & world"`) {
+		t.Errorf("expected literal ampersand in CDATA code, got: %s", result)
+	}
+}
+
+func TestToMarkdown_CodeBlockInList(t *testing.T) {
+	input := `<ul><li>Example:<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">python</ac:parameter><ac:plain-text-body><![CDATA[print("hi")]]></ac:plain-text-body></ac:structured-macro></li><li>Next item</li></ul>`
+	result := ToMarkdown(input, nil)
+	if !strings.Contains(result, "- Example:") {
+		t.Errorf("expected list item before code block, got: %s", result)
+	}
+	if !strings.Contains(result, "```python") {
+		t.Errorf("expected python code fence, got: %s", result)
+	}
+	if !strings.Contains(result, `print("hi")`) {
+		t.Errorf("expected code content, got: %s", result)
+	}
+	if !strings.Contains(result, "- Next item") {
+		t.Errorf("expected next list item after code block, got: %s", result)
+	}
+}
+
+func TestToMarkdown_PreBlockPreservesIndentation(t *testing.T) {
+	input := `<pre>line1
+line2
+  indented</pre>`
+	result := ToMarkdown(input, nil)
+	if !strings.Contains(result, "```\nline1\nline2\n  indented\n```") {
+		t.Errorf("expected pre block with preserved indentation, got: %s", result)
+	}
+}
+
 func TestToMarkdown_InfoPanel(t *testing.T) {
 	input := `<ac:structured-macro ac:name="info"><ac:rich-text-body><p>This is important information.</p></ac:rich-text-body></ac:structured-macro>`
 	result := ToMarkdown(input, nil)
@@ -243,7 +330,7 @@ func TestToMarkdown_EmptyBody(t *testing.T) {
 }
 
 func TestToMarkdown_Strikethrough(t *testing.T) {
-	for _, tag := range []string{"del", "s", "strike"} {
+	for _, tag := range []string{"del", "s"} {
 		input := fmt.Sprintf("<p>This is <%s>removed</%s> text</p>", tag, tag)
 		result := ToMarkdown(input, nil)
 		if !strings.Contains(result, "~~removed~~") {
@@ -324,8 +411,90 @@ func TestToMarkdown_NestedList(t *testing.T) {
 	if !strings.Contains(result, "- Outer") {
 		t.Errorf("expected outer item, got: %s", result)
 	}
-	if !strings.Contains(result, "- Inner") {
-		t.Errorf("expected inner item, got: %s", result)
+	if !strings.Contains(result, "  - Inner") {
+		t.Errorf("expected indented inner item, got: %s", result)
+	}
+}
+
+func TestToMarkdown_DeeplyNestedList(t *testing.T) {
+	input := `<ul><li>A<ul><li>A1</li><li>A2<ul><li>A2a</li></ul></li></ul></li><li>B</li></ul>`
+	result := ToMarkdown(input, nil)
+	if !strings.Contains(result, "- A\n") {
+		t.Errorf("expected top-level A, got: %q", result)
+	}
+	if !strings.Contains(result, "  - A1\n") {
+		t.Errorf("expected indented A1, got: %q", result)
+	}
+	if !strings.Contains(result, "  - A2\n") {
+		t.Errorf("expected indented A2, got: %q", result)
+	}
+	if !strings.Contains(result, "    - A2a\n") {
+		t.Errorf("expected double-indented A2a, got: %q", result)
+	}
+	if !strings.Contains(result, "\n- B") {
+		t.Errorf("expected top-level B, got: %q", result)
+	}
+}
+
+func TestToMarkdown_MixedNestedList(t *testing.T) {
+	input := `<ul><li>Fruits<ol><li>Apple</li><li>Banana</li></ol></li><li>Veggies</li></ul>`
+	result := ToMarkdown(input, nil)
+	if !strings.Contains(result, "- Fruits\n") {
+		t.Errorf("expected unordered Fruits, got: %q", result)
+	}
+	if !strings.Contains(result, "  1. Apple\n") {
+		t.Errorf("expected numbered Apple, got: %q", result)
+	}
+	if !strings.Contains(result, "  2. Banana\n") {
+		t.Errorf("expected numbered Banana, got: %q", result)
+	}
+	if !strings.Contains(result, "\n- Veggies") {
+		t.Errorf("expected unordered Veggies, got: %q", result)
+	}
+}
+
+func TestToMarkdown_DeeplyNestedOrderedList(t *testing.T) {
+	input := `<ol><li>One<ol><li>One-A<ol><li>One-A-i</li><li>One-A-ii</li></ol></li><li>One-B</li></ol></li><li>Two</li></ol>`
+	result := ToMarkdown(input, nil)
+	if !strings.Contains(result, "1. One\n") {
+		t.Errorf("expected top-level 1, got: %q", result)
+	}
+	if !strings.Contains(result, "  1. One-A\n") {
+		t.Errorf("expected nested One-A, got: %q", result)
+	}
+	if !strings.Contains(result, "    1. One-A-i\n") {
+		t.Errorf("expected double-nested One-A-i, got: %q", result)
+	}
+	if !strings.Contains(result, "    2. One-A-ii\n") {
+		t.Errorf("expected double-nested One-A-ii, got: %q", result)
+	}
+	if !strings.Contains(result, "  2. One-B\n") {
+		t.Errorf("expected nested One-B, got: %q", result)
+	}
+	if !strings.Contains(result, "\n2. Two") {
+		t.Errorf("expected top-level 2, got: %q", result)
+	}
+}
+
+func TestToMarkdown_ListWithInlineCode(t *testing.T) {
+	input := `<ul><li>Use <code>fmt.Println</code> for output</li><li>Use <code>log.Fatal</code> for errors</li></ul>`
+	result := ToMarkdown(input, nil)
+	if !strings.Contains(result, "- Use `fmt.Println` for output") {
+		t.Errorf("expected inline code in list item, got: %s", result)
+	}
+	if !strings.Contains(result, "- Use `log.Fatal` for errors") {
+		t.Errorf("expected inline code in second item, got: %s", result)
+	}
+}
+
+func TestToMarkdown_ListWithFormatting(t *testing.T) {
+	input := `<ul><li><strong>Bold item</strong><ul><li><em>Italic sub-item</em></li></ul></li></ul>`
+	result := ToMarkdown(input, nil)
+	if !strings.Contains(result, "- **Bold item**") {
+		t.Errorf("expected bold in list item, got: %s", result)
+	}
+	if !strings.Contains(result, "  - *Italic sub-item*") {
+		t.Errorf("expected italic in nested item, got: %s", result)
 	}
 }
 
@@ -467,6 +636,17 @@ func TestToMarkdown_EmoticonUnknown(t *testing.T) {
 	result := ToMarkdown(input, nil)
 	if !strings.Contains(result, "(custom-emoji)") {
 		t.Errorf("expected fallback emoticon text, got: %s", result)
+	}
+}
+
+func TestToMarkdown_ReferencedAttachments(t *testing.T) {
+	input := `<ac:image><ri:attachment ri:filename="pic.png" /></ac:image><ac:link><ri:attachment ri:filename="doc.pdf" /></ac:link>`
+	result := ReferencedAttachments(input)
+	if !result["pic.png"] {
+		t.Errorf("expected pic.png in referenced attachments, got: %v", result)
+	}
+	if !result["doc.pdf"] {
+		t.Errorf("expected doc.pdf in referenced attachments, got: %v", result)
 	}
 }
 

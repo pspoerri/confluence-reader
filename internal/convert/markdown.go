@@ -1,25 +1,19 @@
 package convert
 
 import (
+	"encoding/xml"
 	"fmt"
-	"regexp"
+	"html"
+	"io"
 	"strings"
 
 	"github.com/pspoerri/confluence-reader/internal/api"
-	"golang.org/x/net/html"
 )
 
 // ToMarkdown converts Confluence storage format HTML into Markdown.
 // Attachment references are rewritten to [filename](attachment:filename).
 func ToMarkdown(storageHTML string, attachments []api.Attachment) string {
-	attachMap := make(map[string]api.Attachment, len(attachments))
-	for _, a := range attachments {
-		attachMap[a.Title] = a
-	}
-
-	c := &converter{
-		attachments: attachMap,
-	}
+	c := &converter{}
 	s := c.convert(storageHTML)
 
 	// Append attachment list at the end if any exist.
@@ -52,12 +46,51 @@ var panelNames = map[string]string{
 	"decision": "Decision", "expand": "Details",
 }
 
+// nodeKind identifies the type of a parsed XML node.
+type nodeKind int
+
+const (
+	documentNode nodeKind = iota
+	elementNode
+	textNode
+)
+
+// node is a simple tree node for the parsed XML content.
+type node struct {
+	kind        nodeKind
+	data        string     // tag name for elements, text content for text nodes
+	attr        []xml.Attr // attributes (elements only)
+	firstChild  *node
+	lastChild   *node
+	nextSibling *node
+}
+
+// appendChild adds a child to the end of n's children list.
+func (n *node) appendChild(child *node) {
+	if n.lastChild == nil {
+		n.firstChild = child
+	} else {
+		n.lastChild.nextSibling = child
+	}
+	n.lastChild = child
+}
+
 // converter holds state during HTML-to-Markdown conversion.
 type converter struct {
-	attachments map[string]api.Attachment
-	buf         strings.Builder
-	listDepth   int
-	inCode      bool // inside <pre> or code macro — suppress formatting
+	buf       strings.Builder
+	listDepth int
+}
+
+// rewriteNamespaces rewrites Confluence XML namespace prefixes (ac:, ri:)
+// to hyphens so the XML parser treats them as regular element/attribute names.
+func rewriteNamespaces(s string) string {
+	s = strings.ReplaceAll(s, "<ac:", "<ac-")
+	s = strings.ReplaceAll(s, "</ac:", "</ac-")
+	s = strings.ReplaceAll(s, "<ri:", "<ri-")
+	s = strings.ReplaceAll(s, "</ri:", "</ri-")
+	s = strings.ReplaceAll(s, " ac:", " ac-")
+	s = strings.ReplaceAll(s, " ri:", " ri-")
+	return s
 }
 
 // convert is the main entry point: pre-process namespaces, parse, walk the tree.
@@ -66,34 +99,12 @@ func (c *converter) convert(storageHTML string) string {
 		return ""
 	}
 
-	// Confluence storage format uses XML namespaces (ac:, ri:) that are not
-	// valid HTML5. Rewrite the colons to hyphens so the HTML parser treats
-	// them as regular custom elements.
-	s := storageHTML
-	s = strings.ReplaceAll(s, "<ac:", "<ac-")
-	s = strings.ReplaceAll(s, "</ac:", "</ac-")
-	s = strings.ReplaceAll(s, "<ri:", "<ri-")
-	s = strings.ReplaceAll(s, "</ri:", "</ri-")
-	// Also handle attribute prefixes.
-	s = strings.ReplaceAll(s, " ac:", " ac-")
-	s = strings.ReplaceAll(s, " ri:", " ri-")
+	s := rewriteNamespaces(storageHTML)
 
-	// CDATA sections are XML-only and not supported by the HTML5 parser.
-	// Convert <![CDATA[...]]> to HTML-escaped text so the content survives parsing.
-	cdataRe := regexp.MustCompile(`<!\[CDATA\[([\s\S]*?)\]\]>`)
-	s = cdataRe.ReplaceAllStringFunc(s, func(match string) string {
-		inner := cdataRe.FindStringSubmatch(match)[1]
-		// Escape HTML special chars so the parser treats them as text.
-		inner = strings.ReplaceAll(inner, "&", "&amp;")
-		inner = strings.ReplaceAll(inner, "<", "&lt;")
-		inner = strings.ReplaceAll(inner, ">", "&gt;")
-		return inner
-	})
-
-	doc, err := html.Parse(strings.NewReader(s))
+	doc, err := parseXML(s)
 	if err != nil {
 		// Fallback: return the raw HTML with tags stripped.
-		return regexp.MustCompile(`<[^>]+>`).ReplaceAllString(storageHTML, "")
+		return stripTags(storageHTML)
 	}
 
 	c.renderNode(doc)
@@ -101,45 +112,113 @@ func (c *converter) convert(storageHTML string) string {
 	result := c.buf.String()
 
 	// Collapse excessive newlines.
-	result = regexp.MustCompile(`\n{3,}`).ReplaceAllString(result, "\n\n")
+	for strings.Contains(result, "\n\n\n") {
+		result = strings.ReplaceAll(result, "\n\n\n", "\n\n")
+	}
 
 	return result
 }
 
-// renderNode dispatches rendering for a single node and its children.
-func (c *converter) renderNode(n *html.Node) {
-	switch n.Type {
-	case html.TextNode:
-		text := n.Data
-		if !c.inCode {
-			c.buf.WriteString(text)
-		} else {
-			c.buf.WriteString(text)
+// parseXML parses a pre-processed HTML/XML string into a simple node tree.
+// It wraps the input in a synthetic <root> element for well-formedness.
+func parseXML(s string) (*node, error) {
+	decoder := xml.NewDecoder(strings.NewReader("<root>" + s + "</root>"))
+	decoder.Strict = false
+	decoder.Entity = xml.HTMLEntity
+
+	doc := &node{kind: documentNode}
+	stack := []*node{doc}
+
+	for {
+		tok, err := decoder.Token()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
 		}
+		parent := stack[len(stack)-1]
+		switch t := tok.(type) {
+		case xml.StartElement:
+			name := t.Name.Local
+			if name == "root" && len(stack) == 1 {
+				continue // skip our synthetic wrapper
+			}
+			elem := &node{
+				kind: elementNode,
+				data: name,
+				attr: make([]xml.Attr, len(t.Attr)),
+			}
+			copy(elem.attr, t.Attr)
+			parent.appendChild(elem)
+			stack = append(stack, elem)
+
+		case xml.EndElement:
+			name := t.Name.Local
+			if name == "root" && len(stack) == 1 {
+				continue
+			}
+			if len(stack) > 1 {
+				stack = stack[:len(stack)-1]
+			}
+
+		case xml.CharData:
+			text := string(t)
+			if text != "" {
+				tn := &node{kind: textNode, data: text}
+				parent.appendChild(tn)
+			}
+		}
+	}
+
+	return doc, nil
+}
+
+// stripTags removes all XML/HTML tags from a string and decodes HTML entities.
+func stripTags(s string) string {
+	var buf strings.Builder
+	inTag := false
+	for _, r := range s {
+		if r == '<' {
+			inTag = true
+		} else if r == '>' {
+			inTag = false
+		} else if !inTag {
+			buf.WriteRune(r)
+		}
+	}
+	return html.UnescapeString(buf.String())
+}
+
+// renderNode dispatches rendering for a single node and its children.
+func (c *converter) renderNode(n *node) {
+	switch n.kind {
+	case textNode:
+		c.buf.WriteString(n.data)
 		return
 
-	case html.ElementNode:
+	case elementNode:
 		if c.renderElement(n) {
 			return // element handled itself and its children
 		}
 
-	case html.DocumentNode:
+	case documentNode:
 		// fall through to render children
 	}
 
 	// Default: render children.
-	for child := n.FirstChild; child != nil; child = child.NextSibling {
+	for child := n.firstChild; child != nil; child = child.nextSibling {
 		c.renderNode(child)
 	}
 }
 
-// renderElement handles a single HTML element. Returns true if it handled
+// renderElement handles a single element. Returns true if it handled
 // its own children (so the caller should not recurse into them).
-func (c *converter) renderElement(n *html.Node) bool {
-	tag := n.Data
+func (c *converter) renderElement(n *node) bool {
+	switch n.data {
 
-	// Confluence custom elements (namespace rewritten from ac: to ac-).
-	switch tag {
+	// --- Confluence custom elements (namespace rewritten from ac:/ri: to ac-/ri-) ---
+
 	case "ac-structured-macro":
 		c.renderMacro(n)
 		return true
@@ -160,87 +239,26 @@ func (c *converter) renderElement(n *html.Node) bool {
 			c.buf.WriteString("(" + name + ")")
 		}
 		return true
-	}
 
-	// Standard HTML elements.
-	switch tag {
+	// --- Block elements ---
+
 	case "h1", "h2", "h3", "h4", "h5", "h6":
-		level := int(tag[1] - '0')
+		level := int(n.data[1] - '0')
 		c.buf.WriteString(strings.Repeat("#", level) + " ")
 		c.renderChildren(n)
 		c.buf.WriteString("\n\n")
 		return true
-
-	case "strong", "b":
-		c.buf.WriteString("**")
-		c.renderChildren(n)
-		c.buf.WriteString("**")
-		return true
-
-	case "em", "i":
-		c.buf.WriteString("*")
-		c.renderChildren(n)
-		c.buf.WriteString("*")
-		return true
-
-	case "del", "s", "strike":
-		c.buf.WriteString("~~")
-		c.renderChildren(n)
-		c.buf.WriteString("~~")
-		return true
-
-	case "u":
-		c.buf.WriteString("*")
-		c.renderChildren(n)
-		c.buf.WriteString("*")
-		return true
-
-	case "sup":
-		c.buf.WriteString("^(")
-		c.renderChildren(n)
-		c.buf.WriteString(")")
-		return true
-
-	case "sub":
-		c.buf.WriteString("~(")
-		c.renderChildren(n)
-		c.buf.WriteString(")")
-		return true
-
-	case "code":
-		inner := c.collectText(n)
-		c.buf.WriteString("`" + inner + "`")
-		return true
-
-	case "pre":
-		inner := c.collectText(n)
-		c.buf.WriteString("\n```\n" + inner + "\n```\n")
-		return true
-
-	case "a":
-		href := attr(n, "href")
-		c.buf.WriteString("[")
-		c.renderChildren(n)
-		c.buf.WriteString("](")
-		c.buf.WriteString(href)
-		c.buf.WriteString(")")
-		return true
-
 	case "p":
 		c.renderChildren(n)
 		c.buf.WriteString("\n\n")
 		return true
-
 	case "br":
 		c.buf.WriteString("\n")
 		return true
-
 	case "hr":
 		c.buf.WriteString("\n---\n")
 		return true
-
 	case "blockquote":
-		// Render children into a sub-buffer, then prefix each line with "> ".
 		inner := c.renderToString(n)
 		inner = strings.TrimSpace(inner)
 		for _, line := range strings.Split(inner, "\n") {
@@ -248,41 +266,86 @@ func (c *converter) renderElement(n *html.Node) bool {
 		}
 		c.buf.WriteString("\n")
 		return true
+	case "pre":
+		inner := collectAllText(n)
+		c.buf.WriteString("\n```\n" + inner + "\n```\n")
+		return true
+
+	// --- Inline formatting ---
+
+	case "strong", "b":
+		c.buf.WriteString("**")
+		c.renderChildren(n)
+		c.buf.WriteString("**")
+		return true
+	case "em", "i":
+		c.buf.WriteString("*")
+		c.renderChildren(n)
+		c.buf.WriteString("*")
+		return true
+	case "del", "s", "strike":
+		c.buf.WriteString("~~")
+		c.renderChildren(n)
+		c.buf.WriteString("~~")
+		return true
+	case "u":
+		c.buf.WriteString("*")
+		c.renderChildren(n)
+		c.buf.WriteString("*")
+		return true
+	case "sup":
+		c.buf.WriteString("^(")
+		c.renderChildren(n)
+		c.buf.WriteString(")")
+		return true
+	case "sub":
+		c.buf.WriteString("~(")
+		c.renderChildren(n)
+		c.buf.WriteString(")")
+		return true
+	case "code":
+		c.buf.WriteString("`" + collectAllText(n) + "`")
+		return true
+	case "a":
+		c.buf.WriteString("[")
+		c.renderChildren(n)
+		c.buf.WriteString("](" + attr(n, "href") + ")")
+		return true
+
+	// --- Lists ---
 
 	case "ul":
 		c.renderList(n, false)
 		return true
-
 	case "ol":
 		c.renderList(n, true)
 		return true
+
+	// --- Tables ---
 
 	case "table":
 		c.renderTable(n)
 		return true
 
+	// --- Definition lists ---
+
 	case "dl":
 		c.renderDefinitionList(n)
 		return true
-
-	// Structural wrappers that we just pass through.
-	case "html", "head", "body", "div", "span",
-		"thead", "tbody", "tfoot", "colgroup", "col":
-		return false // render children normally
 	}
 
-	return false // unknown tag — render children
+	return false // unknown or structural tag — render children
 }
 
 // renderChildren renders all child nodes of n.
-func (c *converter) renderChildren(n *html.Node) {
-	for child := n.FirstChild; child != nil; child = child.NextSibling {
+func (c *converter) renderChildren(n *node) {
+	for child := n.firstChild; child != nil; child = child.nextSibling {
 		c.renderNode(child)
 	}
 }
 
 // renderToString renders a node's children into a temporary buffer and returns the result.
-func (c *converter) renderToString(n *html.Node) string {
+func (c *converter) renderToString(n *node) string {
 	saved := c.buf
 	c.buf = strings.Builder{}
 	c.renderChildren(n)
@@ -291,26 +354,10 @@ func (c *converter) renderToString(n *html.Node) string {
 	return result
 }
 
-// collectText extracts all text content from a node tree, stripping tags.
-func (c *converter) collectText(n *html.Node) string {
-	var buf strings.Builder
-	var walk func(*html.Node)
-	walk = func(node *html.Node) {
-		if node.Type == html.TextNode {
-			buf.WriteString(node.Data)
-		}
-		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			walk(child)
-		}
-	}
-	walk(n)
-	return buf.String()
-}
-
 // --- Confluence macros ---
 
 // renderMacro dispatches ac-structured-macro elements by their ac-name attribute.
-func (c *converter) renderMacro(n *html.Node) {
+func (c *converter) renderMacro(n *node) {
 	name := attr(n, "ac-name")
 
 	switch name {
@@ -367,7 +414,7 @@ func (c *converter) renderMacro(n *html.Node) {
 }
 
 // renderMacroBody finds the ac-rich-text-body child and renders its contents.
-func (c *converter) renderMacroBody(n *html.Node) string {
+func (c *converter) renderMacroBody(n *node) string {
 	body := findChild(n, "ac-rich-text-body")
 	if body == nil {
 		return ""
@@ -376,25 +423,25 @@ func (c *converter) renderMacroBody(n *html.Node) string {
 }
 
 // renderTaskList handles ac-task-list elements.
-func (c *converter) renderTaskList(n *html.Node) {
-	for child := n.FirstChild; child != nil; child = child.NextSibling {
-		if child.Type == html.ElementNode && child.Data == "ac-task" {
+func (c *converter) renderTaskList(n *node) {
+	for child := n.firstChild; child != nil; child = child.nextSibling {
+		if child.kind == elementNode && child.data == "ac-task" {
 			c.renderTask(child)
 		}
 	}
 }
 
 // renderTask handles a single ac-task element.
-func (c *converter) renderTask(n *html.Node) {
+func (c *converter) renderTask(n *node) {
 	status := ""
 	body := ""
-	for child := n.FirstChild; child != nil; child = child.NextSibling {
-		if child.Type != html.ElementNode {
+	for child := n.firstChild; child != nil; child = child.nextSibling {
+		if child.kind != elementNode {
 			continue
 		}
-		switch child.Data {
+		switch child.data {
 		case "ac-task-status":
-			status = strings.TrimSpace(c.collectText(child))
+			status = strings.TrimSpace(collectAllText(child))
 		case "ac-task-body":
 			body = strings.TrimSpace(c.renderToString(child))
 		}
@@ -407,10 +454,7 @@ func (c *converter) renderTask(n *html.Node) {
 }
 
 // renderACLink handles ac-link elements (user mentions, page links, attachment links).
-// Note: the HTML5 parser does not know that ri-* elements are void/self-closing,
-// so subsequent siblings may be nested inside them. We use findDescendant to
-// search the full subtree rather than just direct children.
-func (c *converter) renderACLink(n *html.Node) {
+func (c *converter) renderACLink(n *node) {
 	// Helper to get the CDATA body text from anywhere in the subtree.
 	label := func() string { return descendantText(n, "ac-plain-text-link-body") }
 
@@ -451,7 +495,7 @@ func (c *converter) renderACLink(n *html.Node) {
 }
 
 // renderACImage handles ac-image elements.
-func (c *converter) renderACImage(n *html.Node) {
+func (c *converter) renderACImage(n *node) {
 	if att := findDescendant(n, "ri-attachment"); att != nil {
 		filename := attr(att, "ri-filename")
 		c.buf.WriteString(fmt.Sprintf("![%s](attachment:%s)", filename, filename))
@@ -463,10 +507,10 @@ func (c *converter) renderACImage(n *html.Node) {
 // --- Lists ---
 
 // renderList renders an <ol> or <ul> element with proper nesting.
-func (c *converter) renderList(n *html.Node, ordered bool) {
+func (c *converter) renderList(n *node, ordered bool) {
 	itemNum := 0
-	for child := n.FirstChild; child != nil; child = child.NextSibling {
-		if child.Type != html.ElementNode || child.Data != "li" {
+	for child := n.firstChild; child != nil; child = child.nextSibling {
+		if child.kind != elementNode || child.data != "li" {
 			continue
 		}
 		itemNum++
@@ -479,11 +523,11 @@ func (c *converter) renderList(n *html.Node, ordered bool) {
 		}
 
 		// Render the li's children. Nested lists will be handled recursively.
-		for liChild := child.FirstChild; liChild != nil; liChild = liChild.NextSibling {
-			if liChild.Type == html.ElementNode && (liChild.Data == "ul" || liChild.Data == "ol") {
+		for liChild := child.firstChild; liChild != nil; liChild = liChild.nextSibling {
+			if liChild.kind == elementNode && (liChild.data == "ul" || liChild.data == "ol") {
 				c.buf.WriteString("\n")
 				c.listDepth++
-				if liChild.Data == "ol" {
+				if liChild.data == "ol" {
 					c.renderList(liChild, true)
 				} else {
 					c.renderList(liChild, false)
@@ -505,7 +549,7 @@ func (c *converter) renderList(n *html.Node, ordered bool) {
 // --- Tables ---
 
 // renderTable collects all rows/cells from a <table> then emits a markdown table.
-func (c *converter) renderTable(n *html.Node) {
+func (c *converter) renderTable(n *node) {
 	var rows [][]string
 	c.collectRows(n, &rows)
 
@@ -529,21 +573,21 @@ func (c *converter) renderTable(n *html.Node) {
 }
 
 // collectRows walks the table tree collecting rows from thead/tbody or directly.
-func (c *converter) collectRows(n *html.Node, rows *[][]string) {
-	for child := n.FirstChild; child != nil; child = child.NextSibling {
-		if child.Type != html.ElementNode {
+func (c *converter) collectRows(n *node, rows *[][]string) {
+	for child := n.firstChild; child != nil; child = child.nextSibling {
+		if child.kind != elementNode {
 			continue
 		}
-		switch child.Data {
+		switch child.data {
 		case "thead", "tbody", "tfoot":
 			c.collectRows(child, rows)
 		case "tr":
 			var cols []string
-			for cell := child.FirstChild; cell != nil; cell = cell.NextSibling {
-				if cell.Type == html.ElementNode && (cell.Data == "th" || cell.Data == "td") {
+			for cell := child.firstChild; cell != nil; cell = cell.nextSibling {
+				if cell.kind == elementNode && (cell.data == "th" || cell.data == "td") {
 					text := strings.TrimSpace(c.renderToString(cell))
-					// Collapse internal newlines for table cells.
-					text = regexp.MustCompile(`\s*\n\s*`).ReplaceAllString(text, " ")
+					// Collapse internal whitespace/newlines for table cells.
+					text = strings.Join(strings.Fields(text), " ")
 					cols = append(cols, text)
 				}
 			}
@@ -556,13 +600,13 @@ func (c *converter) collectRows(n *html.Node, rows *[][]string) {
 
 // --- Definition lists ---
 
-func (c *converter) renderDefinitionList(n *html.Node) {
+func (c *converter) renderDefinitionList(n *node) {
 	c.buf.WriteString("\n")
-	for child := n.FirstChild; child != nil; child = child.NextSibling {
-		if child.Type != html.ElementNode {
+	for child := n.firstChild; child != nil; child = child.nextSibling {
+		if child.kind != elementNode {
 			continue
 		}
-		switch child.Data {
+		switch child.data {
 		case "dt":
 			c.buf.WriteString("**")
 			c.renderChildren(child)
@@ -579,19 +623,19 @@ func (c *converter) renderDefinitionList(n *html.Node) {
 // --- Helper functions ---
 
 // attr returns the value of an attribute on a node (empty string if not found).
-func attr(n *html.Node, key string) string {
-	for _, a := range n.Attr {
-		if a.Key == key {
-			return a.Val
+func attr(n *node, key string) string {
+	for _, a := range n.attr {
+		if a.Name.Local == key {
+			return a.Value
 		}
 	}
 	return ""
 }
 
 // findChild returns the first child element with the given tag name, or nil.
-func findChild(n *html.Node, tag string) *html.Node {
-	for child := n.FirstChild; child != nil; child = child.NextSibling {
-		if child.Type == html.ElementNode && child.Data == tag {
+func findChild(n *node, tag string) *node {
+	for child := n.firstChild; child != nil; child = child.nextSibling {
+		if child.kind == elementNode && child.data == tag {
 			return child
 		}
 	}
@@ -599,10 +643,10 @@ func findChild(n *html.Node, tag string) *html.Node {
 }
 
 // findDescendant returns the first descendant element with the given tag, depth-first.
-func findDescendant(n *html.Node, tag string) *html.Node {
-	for child := n.FirstChild; child != nil; child = child.NextSibling {
-		if child.Type == html.ElementNode {
-			if child.Data == tag {
+func findDescendant(n *node, tag string) *node {
+	for child := n.firstChild; child != nil; child = child.nextSibling {
+		if child.kind == elementNode {
+			if child.data == tag {
 				return child
 			}
 			if found := findDescendant(child, tag); found != nil {
@@ -615,9 +659,9 @@ func findDescendant(n *html.Node, tag string) *html.Node {
 
 // macroParam extracts a named parameter from an ac-structured-macro.
 // <ac-parameter ac-name="language">python</ac-parameter>
-func macroParam(macro *html.Node, name string) string {
-	for child := macro.FirstChild; child != nil; child = child.NextSibling {
-		if child.Type == html.ElementNode && child.Data == "ac-parameter" && attr(child, "ac-name") == name {
+func macroParam(macro *node, name string) string {
+	for child := macro.firstChild; child != nil; child = child.nextSibling {
+		if child.kind == elementNode && child.data == "ac-parameter" && attr(child, "ac-name") == name {
 			return strings.TrimSpace(collectAllText(child))
 		}
 	}
@@ -625,7 +669,7 @@ func macroParam(macro *html.Node, name string) string {
 }
 
 // macroCDATA extracts the CDATA content from an ac-plain-text-body descendant.
-func macroCDATA(macro *html.Node) string {
+func macroCDATA(macro *node) string {
 	body := findDescendant(macro, "ac-plain-text-body")
 	if body == nil {
 		return ""
@@ -634,7 +678,7 @@ func macroCDATA(macro *html.Node) string {
 }
 
 // descendantText finds a descendant element by tag and returns its text content.
-func descendantText(n *html.Node, tag string) string {
+func descendantText(n *node, tag string) string {
 	child := findDescendant(n, tag)
 	if child == nil {
 		return ""
@@ -643,14 +687,14 @@ func descendantText(n *html.Node, tag string) string {
 }
 
 // collectAllText extracts all text from a node tree.
-func collectAllText(n *html.Node) string {
+func collectAllText(n *node) string {
 	var buf strings.Builder
-	var walk func(*html.Node)
-	walk = func(node *html.Node) {
-		if node.Type == html.TextNode {
-			buf.WriteString(node.Data)
+	var walk func(*node)
+	walk = func(nd *node) {
+		if nd.kind == textNode {
+			buf.WriteString(nd.data)
 		}
-		for child := node.FirstChild; child != nil; child = child.NextSibling {
+		for child := nd.firstChild; child != nil; child = child.nextSibling {
 			walk(child)
 		}
 	}
@@ -661,12 +705,26 @@ func collectAllText(n *html.Node) string {
 // ReferencedAttachments returns the set of attachment filenames that are
 // referenced in the Confluence storage-format HTML (via <ri:attachment>).
 func ReferencedAttachments(storageHTML string) map[string]bool {
-	re := regexp.MustCompile(`<ri:attachment\s[^>]*ri:filename="([^"]+)"`)
-	matches := re.FindAllStringSubmatch(storageHTML, -1)
-	result := make(map[string]bool, len(matches))
-	for _, m := range matches {
-		result[m[1]] = true
+	s := rewriteNamespaces(storageHTML)
+
+	doc, err := parseXML(s)
+	if err != nil {
+		return nil
 	}
+
+	result := make(map[string]bool)
+	var walk func(*node)
+	walk = func(n *node) {
+		if n.kind == elementNode && n.data == "ri-attachment" {
+			if filename := attr(n, "ri-filename"); filename != "" {
+				result[filename] = true
+			}
+		}
+		for child := n.firstChild; child != nil; child = child.nextSibling {
+			walk(child)
+		}
+	}
+	walk(doc)
 	return result
 }
 

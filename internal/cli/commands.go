@@ -914,6 +914,25 @@ func (a *App) processJob(cs *cache.CachedSpace, job pageJob, allFiles bool, bar 
 		downloadAtts = filtered
 	}
 
+	// Download attachments first so the drawio renderer can read .drawio
+	// files from disk and convert them to PDF before we commit index.md.
+	for _, att := range downloadAtts {
+		newName := job.renameMap[att.Title]
+		outPath := filepath.Join(job.dir, sanitizeFilename(newName))
+		markWritten(outPath)
+		if err := a.downloadAttachment(cs, att, job.pageID, newName, job.dir); err != nil {
+			bar.Log("warning: %v", err)
+		}
+	}
+
+	// Render any drawio diagrams to sibling PDFs and rewrite the
+	// *(diagram: name)* placeholders in the markdown.
+	updatedMd, pdfPaths := renderDrawioPlaceholders(md, job.dir, job.renameMap, downloadAtts, bar)
+	md = updatedMd
+	for _, p := range pdfPaths {
+		markWritten(p)
+	}
+
 	fm := Frontmatter{
 		Title:      page.Title,
 		PageID:     page.ID,
@@ -934,15 +953,6 @@ func (a *App) processJob(cs *cache.CachedSpace, job pageJob, allFiles bool, bar 
 	}
 	markWritten(indexPath)
 	bar.Increment()
-
-	for _, att := range downloadAtts {
-		newName := job.renameMap[att.Title]
-		outPath := filepath.Join(job.dir, sanitizeFilename(newName))
-		markWritten(outPath)
-		if err := a.downloadAttachment(cs, att, job.pageID, newName, job.dir); err != nil {
-			bar.Log("warning: %v", err)
-		}
-	}
 
 	return nil
 }

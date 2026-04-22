@@ -7,6 +7,7 @@ import (
 
 	"github.com/pspoerri/confluence-reader/internal/cli"
 	"github.com/pspoerri/confluence-reader/internal/ui"
+	"github.com/pspoerri/confluence-reader/internal/version"
 )
 
 const usage = `confluence-reader - browse Confluence spaces like a filesystem
@@ -24,9 +25,11 @@ Commands:
   read-file                 Download an attachment
   mirror                    Mirror a space to a local directory
   refresh                   Force-refresh the local cache for a space
+  version                   Show version, commit, and build time
   help [<command>]          Show this help, or help for a specific command
 
 Run 'confluence-reader <command> --help' for command-specific flags.
+Run 'confluence-reader --version' (or -V) for a one-line version banner.
 
 Configuration:
   Run 'confluence-reader configure' to set up your credentials.
@@ -88,6 +91,9 @@ func main() {
 	switch name {
 	case "help", "-h", "--help":
 		printHelp(rest)
+		return
+	case "version", "-V", "--version":
+		fmt.Print(version.Read().Detailed())
 		return
 	case "configure":
 		if err := cli.RunConfigure(out); err != nil {

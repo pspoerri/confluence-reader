@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -130,8 +132,9 @@ func (a *App) RunLs(spaceKey, target string, longFormat, allFiles, refresh bool)
 		fmt.Println("No pages found.")
 		return nil
 	}
+	var prefetched *api.Page
 	if target != "" && target != "/" {
-		pageID, err = a.resolveTarget(cs, space, target)
+		pageID, prefetched, err = a.resolveTarget(cs, space, target)
 		if err != nil {
 			return err
 		}
@@ -152,9 +155,10 @@ func (a *App) RunLs(spaceKey, target string, longFormat, allFiles, refresh bool)
 	}
 
 	// When filtering, fetch the page body to determine which attachments are referenced.
+	// Reuse the prefetched page from resolveTarget when available.
 	var referenced map[string]bool
 	if !allFiles && len(attachments) > 0 {
-		page, err := a.Client.GetPageByID(pageID)
+		page, err := a.fetchPage(prefetched, pageID)
 		if err == nil && page.Body != nil && page.Body.Storage != nil {
 			referenced = convert.ReferencedAttachments(page.Body.Storage.Value)
 		}
@@ -218,16 +222,20 @@ func (a *App) RunLs(spaceKey, target string, longFormat, allFiles, refresh bool)
 }
 
 // resolveTarget resolves a target that can be a page ID, a slash-separated
-// path (e.g. "/Parent/Child"), or a bare page title to a page ID.
-// Uses the full tree if cached, otherwise resolves lazily.
-func (a *App) resolveTarget(cs *cache.CachedSpace, space *api.Space, target string) (string, error) {
+// path (e.g. "/Parent/Child"), or a bare page title to a page ID. Uses the
+// full tree if cached, otherwise resolves lazily.
+//
+// When the target is a numeric ID we fetch the page to validate it exists;
+// the fetched page is returned via prefetched so callers can reuse it instead
+// of issuing a second GetPageByID. prefetched is nil for path/title targets.
+func (a *App) resolveTarget(cs *cache.CachedSpace, space *api.Space, target string) (pageID string, prefetched *api.Page, err error) {
 	target = strings.TrimSuffix(target, "/index.md")
 	target = strings.TrimSuffix(target, "/index.MD")
 
 	// Numeric page ID: try directly.
 	if !strings.Contains(target, "/") && isNumeric(target) {
-		if _, err := a.Client.GetPageByID(target); err == nil {
-			return target, nil
+		if p, err := a.Client.GetPageByID(target); err == nil {
+			return target, p, nil
 		}
 	}
 
@@ -251,17 +259,27 @@ func (a *App) resolveTarget(cs *cache.CachedSpace, space *api.Space, target stri
 			}
 		}
 		if node != nil {
-			return node.Page.ID, nil
+			return node.Page.ID, nil, nil
 		}
-		return "", fmt.Errorf("page not found: %s", target)
+		return "", nil, fmt.Errorf("page not found: %s", target)
 	}
 
 	// Lazy path resolution.
 	if strings.HasPrefix(target, "/") || !strings.Contains(target, "/") {
-		return a.Cache.ResolvePath(a.Client, cs, space.HomepageID, target)
+		id, err := a.Cache.ResolvePath(a.Client, cs, space.HomepageID, target)
+		return id, nil, err
 	}
 
-	return "", fmt.Errorf("page not found: %s", target)
+	return "", nil, fmt.Errorf("page not found: %s", target)
+}
+
+// fetchPage returns prefetched if non-nil, otherwise fetches the page by ID.
+// Used by callers of resolveTarget to avoid a duplicate GetPageByID round trip.
+func (a *App) fetchPage(prefetched *api.Page, pageID string) (*api.Page, error) {
+	if prefetched != nil {
+		return prefetched, nil
+	}
+	return a.Client.GetPageByID(pageID)
 }
 
 // findPageInList looks up a page by ID in the full page list.
@@ -431,12 +449,12 @@ func (a *App) RunRead(spaceKey, target string, refresh bool) error {
 		return err
 	}
 
-	pageID, err := a.resolveTarget(cs, space, target)
+	pageID, prefetched, err := a.resolveTarget(cs, space, target)
 	if err != nil {
 		return err
 	}
 
-	page, err := a.Client.GetPageByID(pageID)
+	page, err := a.fetchPage(prefetched, pageID)
 	if err != nil {
 		return fmt.Errorf("fetch page: %w", err)
 	}
@@ -488,13 +506,13 @@ func (a *App) RunReadFile(spaceKey, target, filename string, refresh bool) error
 		return err
 	}
 
-	pageID, err := a.resolveTarget(cs, space, target)
+	pageID, prefetched, err := a.resolveTarget(cs, space, target)
 	if err != nil {
 		return err
 	}
 
 	// Verify page scope.
-	page, err := a.Client.GetPageByID(pageID)
+	page, err := a.fetchPage(prefetched, pageID)
 	if err != nil {
 		return err
 	}
@@ -575,9 +593,31 @@ func (a *App) RunRefresh(spaceKey string) error {
 	return nil
 }
 
+// mirrorWorkers caps the number of concurrent page-processing goroutines.
+const mirrorWorkers = 8
+
+// pageJob is one page's worth of work prepared in mirror's serial phase 1
+// and consumed by parallel workers in phase 2.
+type pageJob struct {
+	pageID      string
+	pageTitle   string
+	dir         string
+	attachments []api.Attachment
+	renameMap   map[string]string
+}
+
 // RunMirror mirrors an entire Confluence space into a local directory.
 // Each page becomes a folder with an index.md file and its attachments.
 // When allFiles is false, only attachments referenced in the page body are downloaded.
+//
+// Mirror runs in two phases:
+//
+//   - Phase 1 (serial): walk the page tree, mkdir each page directory,
+//     fetch attachment listings (which write to cs), and build per-page
+//     rename maps. This must be serial because cs is mutated.
+//   - Phase 2 (parallel): a worker pool fetches page bodies, converts to
+//     markdown, writes index.md, and downloads attachments. cs is read-only
+//     here; only the shared `written` map and progress bar take a lock.
 func (a *App) RunMirror(spaceKey, targetDir string, allFiles, refresh bool) error {
 	space, err := a.resolveSpace(spaceKey)
 	if err != nil {
@@ -626,38 +666,42 @@ func (a *App) RunMirror(spaceKey, targetDir string, allFiles, refresh bool) erro
 	// Track all paths written during this mirror run.
 	written := make(map[string]bool)
 
-	// Create target directory.
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		return fmt.Errorf("create target directory: %w", err)
 	}
 
-	// Download homepage content into the root directory.
+	// Phase 1: build the directory tree, fetch attachment listings, and
+	// emit one pageJob per page.
+	var jobs []pageJob
 	if homepageNode != nil {
-		if err := a.downloadPage(cs, homepageNode.Page.ID, homepageNode.Page.Title, targetDir, allFiles, bar, written); err != nil {
-			return fmt.Errorf("download homepage: %w", err)
+		job, err := a.prepareJob(cs, homepageNode.Page.ID, homepageNode.Page.Title, targetDir, written)
+		if err != nil {
+			return fmt.Errorf("prepare homepage: %w", err)
 		}
+		jobs = append(jobs, job)
 	}
-
-	// Download all child pages recursively.
 	for _, node := range displayRoots {
-		if err := a.downloadTree(cs, node, targetDir, allFiles, bar, written); err != nil {
+		if err := a.collectJobs(cs, node, targetDir, written, &jobs); err != nil {
 			return err
 		}
 	}
-	bar.Finish()
 
-	// Write sync metadata.
+	// Phase 2: parallel fan-out.
+	err = a.runMirrorWorkers(cs, jobs, allFiles, bar, written)
+	bar.Finish()
+	if err != nil {
+		return err
+	}
+
 	if err := writeSyncMetadata(targetDir, spaceKey, total); err != nil {
 		return fmt.Errorf("write sync metadata: %w", err)
 	}
 
-	// Remove files and directories that no longer exist in the space.
 	removed := cleanStaleEntries(targetDir, written)
 	if removed > 0 {
 		a.UI.Infof("Removed %d stale files/directories", removed)
 	}
 
-	// Persist the updated rename map.
 	if err := a.Cache.Save(cs); err != nil {
 		return fmt.Errorf("save cache: %w", err)
 	}
@@ -666,9 +710,11 @@ func (a *App) RunMirror(spaceKey, targetDir string, allFiles, refresh bool) erro
 	return nil
 }
 
-// downloadTree recursively downloads a page node and its children.
-func (a *App) downloadTree(cs *cache.CachedSpace, node *cache.PageNode, parentDir string, allFiles bool, bar *progress.Bar, written map[string]bool) error {
-	dirName := sanitizeName(node.Page.Title)
+// collectJobs walks the page subtree rooted at node, mkdir-ing each page
+// directory and emitting a pageJob per page. Runs serially because both the
+// directory creation and prepareJob mutate shared state.
+func (a *App) collectJobs(cs *cache.CachedSpace, node *cache.PageNode, parentDir string, written map[string]bool, jobs *[]pageJob) error {
+	dirName := sanitizeFilename(node.Page.Title)
 	dir := filepath.Join(parentDir, dirName)
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -676,33 +722,29 @@ func (a *App) downloadTree(cs *cache.CachedSpace, node *cache.PageNode, parentDi
 	}
 	written[dir] = true
 
-	if err := a.downloadPage(cs, node.Page.ID, node.Page.Title, dir, allFiles, bar, written); err != nil {
+	job, err := a.prepareJob(cs, node.Page.ID, node.Page.Title, dir, written)
+	if err != nil {
 		return err
 	}
+	*jobs = append(*jobs, job)
 
 	for _, child := range node.Children {
-		if err := a.downloadTree(cs, child, dir, allFiles, bar, written); err != nil {
+		if err := a.collectJobs(cs, child, dir, written, jobs); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// downloadPage fetches a page, converts it to markdown, saves index.md,
-// and downloads attachments (with renamed filenames) into the same directory.
-// When allFiles is false, only attachments referenced in the page body are downloaded.
-func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string, allFiles bool, bar *progress.Bar, written map[string]bool) error {
-	page, err := a.Client.GetPageByID(pageID)
-	if err != nil {
-		return fmt.Errorf("fetch page %s: %w", pageID, err)
-	}
-
+// prepareJob fetches the attachment listing for a page (cached in cs) and
+// builds the rename map, recording it in cs.RenamedFiles so that subsequent
+// mirror runs can skip already-downloaded attachments.
+func (a *App) prepareJob(cs *cache.CachedSpace, pageID, pageTitle, dir string, written map[string]bool) (pageJob, error) {
 	attachments, err := a.Cache.EnsureAttachments(a.Client, cs, pageID)
 	if err != nil {
-		return fmt.Errorf("fetch attachments for page %s: %w", pageID, err)
+		return pageJob{}, fmt.Errorf("fetch attachments for page %s: %w", pageID, err)
 	}
 
-	// Build rename map: original filename → new filename.
 	renameMap := make(map[string]string, len(attachments))
 	if cs.RenamedFiles == nil {
 		cs.RenamedFiles = make(map[string]map[string]cache.RenameEntry)
@@ -721,62 +763,133 @@ func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string,
 		}
 	}
 
-	// Convert to markdown.
+	return pageJob{
+		pageID:      pageID,
+		pageTitle:   pageTitle,
+		dir:         dir,
+		attachments: attachments,
+		renameMap:   renameMap,
+	}, nil
+}
+
+// runMirrorWorkers processes pageJobs in parallel. cs must be read-only here:
+// the resolver only reads cs.Pages and cs.Children (both fully populated by
+// EnsureFullTree) and we never call EnsureAttachments/EnsureChildren in this
+// phase. Returns the first error from any worker; once captured, subsequent
+// jobs are drained without execution.
+func (a *App) runMirrorWorkers(cs *cache.CachedSpace, jobs []pageJob, allFiles bool, bar *progress.Bar, written map[string]bool) error {
+	if len(jobs) == 0 {
+		return nil
+	}
+
+	var (
+		errOnce  sync.Once
+		firstErr error
+		writeMu  sync.Mutex
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	markWritten := func(path string) {
+		writeMu.Lock()
+		written[path] = true
+		writeMu.Unlock()
+	}
+
+	jobCh := make(chan pageJob)
+	var wg sync.WaitGroup
+	for i := 0; i < mirrorWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobCh {
+				if ctx.Err() != nil {
+					continue // drain remaining jobs after cancellation
+				}
+				if err := a.processJob(cs, job, allFiles, bar, markWritten); err != nil {
+					errOnce.Do(func() {
+						firstErr = err
+						cancel()
+					})
+				}
+			}
+		}()
+	}
+
+	for _, job := range jobs {
+		select {
+		case <-ctx.Done():
+		case jobCh <- job:
+			continue
+		}
+		break
+	}
+	close(jobCh)
+	wg.Wait()
+
+	return firstErr
+}
+
+// processJob fetches a page body, converts to markdown, writes index.md,
+// and downloads attachments. Safe to run concurrently — cs is read-only here
+// and the only shared mutable state (the `written` map and the progress bar)
+// is locked internally.
+func (a *App) processJob(cs *cache.CachedSpace, job pageJob, allFiles bool, bar *progress.Bar, markWritten func(string)) error {
+	page, err := a.Client.GetPageByID(job.pageID)
+	if err != nil {
+		return fmt.Errorf("fetch page %s: %w", job.pageID, err)
+	}
+
 	var body string
 	if page.Body != nil && page.Body.Storage != nil {
 		body = page.Body.Storage.Value
 	}
+
 	resolver := &liveMacroResolver{
 		client: a.Client,
 		store:  a.Cache,
 		cs:     cs,
-		pageID: pageID,
+		pageID: job.pageID,
 	}
-	result := convert.ToMarkdown(body, attachments, resolver)
+	result := convert.ToMarkdown(body, job.attachments, resolver)
 	if len(result.UnknownTags) > 0 {
-		a.UI.Warnf("unhandled tags in %s: %s", page.Title, strings.Join(result.UnknownTags, ", "))
+		bar.Log("warning: unhandled tags in %s: %s", page.Title, strings.Join(result.UnknownTags, ", "))
 	}
 	md := result.Markdown
 
 	// Rewrite attachment:filename references to renamed local filenames.
-	for origName, newName := range renameMap {
+	for origName, newName := range job.renameMap {
 		md = strings.ReplaceAll(md, "(attachment:"+origName+")", "("+newName+")")
 	}
 	// Catch any remaining attachment: references (shouldn't happen, but safety).
 	md = strings.ReplaceAll(md, "(attachment:", "(")
 
-	var meta strings.Builder
-	meta.WriteString("---\n")
-	fmt.Fprintf(&meta, "title: %q\n", page.Title)
-	fmt.Fprintf(&meta, "page_id: %s\n", page.ID)
-	fmt.Fprintf(&meta, "version: %d\n", page.Version.Number)
-	if page.CreatedAt != "" {
-		fmt.Fprintf(&meta, "created_at: %s\n", page.CreatedAt)
+	fm := Frontmatter{
+		Title:      page.Title,
+		PageID:     page.ID,
+		Version:    page.Version.Number,
+		CreatedAt:  page.CreatedAt,
+		AuthorID:   page.AuthorID,
+		ModifiedAt: page.Version.CreatedAt,
+		ModifiedBy: page.Version.AuthorID,
 	}
-	fmt.Fprintf(&meta, "author_id: %s\n", page.AuthorID)
-	if page.Version.CreatedAt != "" {
-		fmt.Fprintf(&meta, "modified_at: %s\n", page.Version.CreatedAt)
-	}
-	fmt.Fprintf(&meta, "modified_by: %s\n", page.Version.AuthorID)
 	if page.Links.WebUI != "" {
-		fmt.Fprintf(&meta, "source: %s/wiki%s\n", a.Client.BaseURL, page.Links.WebUI)
+		fm.Source = a.Client.BaseURL + "/wiki" + page.Links.WebUI
 	}
-	meta.WriteString("---\n\n")
 
-	content := fmt.Sprintf("%s# %s\n\n%s\n", meta.String(), page.Title, md)
-	indexPath := filepath.Join(dir, "index.md")
+	content := fmt.Sprintf("%s\n# %s\n\n%s\n", fm.Encode(), page.Title, md)
+	indexPath := filepath.Join(job.dir, "index.md")
 	if err := os.WriteFile(indexPath, []byte(content), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", indexPath, err)
 	}
-	written[indexPath] = true
+	markWritten(indexPath)
 	bar.Increment()
 
-	// Determine which attachments to download.
-	downloadAtts := attachments
+	downloadAtts := job.attachments
 	if !allFiles {
 		referenced := convert.ReferencedAttachments(body)
 		var filtered []api.Attachment
-		for _, att := range attachments {
+		for _, att := range job.attachments {
 			if referenced[att.Title] {
 				filtered = append(filtered, att)
 			}
@@ -784,12 +897,11 @@ func (a *App) downloadPage(cs *cache.CachedSpace, pageID, pageTitle, dir string,
 		downloadAtts = filtered
 	}
 
-	// Download attachments into the same directory with renamed filenames.
 	for _, att := range downloadAtts {
-		newName := renameMap[att.Title]
-		outPath := filepath.Join(dir, sanitizeFilename(newName))
-		written[outPath] = true
-		if err := a.downloadAttachment(cs, att, pageID, newName, dir); err != nil {
+		newName := job.renameMap[att.Title]
+		outPath := filepath.Join(job.dir, sanitizeFilename(newName))
+		markWritten(outPath)
+		if err := a.downloadAttachment(cs, att, job.pageID, newName, job.dir); err != nil {
 			bar.Log("warning: %v", err)
 		}
 	}
@@ -943,36 +1055,30 @@ func isNumeric(s string) bool {
 	return true
 }
 
-// sanitizeFilename strips path separators and traversal sequences from a
-// filename so it cannot escape the target directory.
+// unsafeFilenameChars replaces filesystem-unsafe characters with underscores.
+var unsafeFilenameChars = strings.NewReplacer(
+	"/", "_",
+	"\\", "_",
+	":", "_",
+	"*", "_",
+	"?", "_",
+	"\"", "_",
+	"<", "_",
+	">", "_",
+	"|", "_",
+)
+
+// sanitizeFilename produces a safe single-segment file or directory name from
+// arbitrary input. Path separators and shell-unsafe characters are replaced
+// with underscores, then filepath.Base provides defense in depth so the
+// result cannot escape the target directory.
 func sanitizeFilename(name string) string {
-	// Use only the base name to prevent directory traversal.
+	name = unsafeFilenameChars.Replace(strings.TrimSpace(name))
 	name = filepath.Base(name)
 	if name == "." || name == ".." || name == "" {
-		name = "_"
+		return "_"
 	}
 	return name
-}
-
-// sanitizeName replaces characters that are invalid in file/directory names.
-func sanitizeName(name string) string {
-	replacer := strings.NewReplacer(
-		"/", "_",
-		"\\", "_",
-		":", "_",
-		"*", "_",
-		"?", "_",
-		"\"", "_",
-		"<", "_",
-		">", "_",
-		"|", "_",
-	)
-	s := replacer.Replace(name)
-	s = strings.TrimSpace(s)
-	if s == "" {
-		s = "_"
-	}
-	return s
 }
 
 // RunConfigure interactively prompts for Basic Auth credentials and writes the config file.

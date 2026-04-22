@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/pspoerri/confluence-reader/internal/api"
@@ -110,14 +111,7 @@ func (c *converter) unknownTags() []string {
 	for tag := range c.unknown {
 		tags = append(tags, tag)
 	}
-	// Sort is not critical but makes output deterministic.
-	for i := range tags {
-		for j := i + 1; j < len(tags); j++ {
-			if tags[i] > tags[j] {
-				tags[i], tags[j] = tags[j], tags[i]
-			}
-		}
-	}
+	sort.Strings(tags)
 	return tags
 }
 

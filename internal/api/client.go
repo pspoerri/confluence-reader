@@ -7,9 +7,42 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
+
+const (
+	defaultMaxRetries = 3
+	defaultMaxBackoff = 30 * time.Second
+	maxRetryAfter     = 60 * time.Second
+)
+
+// AuthError is returned for 401/403 responses. It carries the HTTP status and
+// request URL so callers can give the user actionable guidance.
+type AuthError struct {
+	Status int
+	URL    string
+}
+
+func (e *AuthError) Error() string {
+	return fmt.Sprintf("authentication failed (HTTP %d) — run 'confluence-reader configure' to update credentials", e.Status)
+}
+
+// APIError is returned for non-auth HTTP errors that are either non-retryable
+// (e.g. 404) or have exhausted the retry budget (5xx, 429).
+type APIError struct {
+	Status int
+	Body   string // truncated, HTML replaced with a plain status description
+	URL    string
+}
+
+func (e *APIError) Error() string {
+	if e.Body == "" {
+		return fmt.Sprintf("api error (status %d) from %s", e.Status, e.URL)
+	}
+	return fmt.Sprintf("api error (status %d): %s", e.Status, e.Body)
+}
 
 // Client communicates with the Confluence Cloud REST API v2.
 type Client struct {
@@ -18,6 +51,15 @@ type Client struct {
 	APIToken   string
 	Verbose    bool
 	HTTPClient *http.Client
+
+	// MaxRetries is the number of retries after the first attempt. The total
+	// number of HTTP calls for one logical request is MaxRetries+1.
+	MaxRetries int
+	// MaxBackoff caps the exponential backoff delay between retries.
+	MaxBackoff time.Duration
+
+	// sleep is the delay function, overridable in tests.
+	sleep func(time.Duration)
 }
 
 // NewClient creates a new Confluence API client using Basic Auth credentials.
@@ -29,6 +71,9 @@ func NewClient(baseURL, email, apiToken string) *Client {
 		HTTPClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		MaxRetries: defaultMaxRetries,
+		MaxBackoff: defaultMaxBackoff,
+		sleep:      time.Sleep,
 	}
 }
 
@@ -39,11 +84,33 @@ func (c *Client) logf(format string, args ...any) {
 	}
 }
 
-// do executes an authenticated request and returns the response body.
-func (c *Client) do(method, path string, query url.Values) ([]byte, error) {
+func (c *Client) maxRetries() int {
+	if c.MaxRetries <= 0 {
+		return defaultMaxRetries
+	}
+	return c.MaxRetries
+}
+
+func (c *Client) maxBackoff() time.Duration {
+	if c.MaxBackoff <= 0 {
+		return defaultMaxBackoff
+	}
+	return c.MaxBackoff
+}
+
+func (c *Client) sleepFor(d time.Duration) {
+	if c.sleep != nil {
+		c.sleep(d)
+		return
+	}
+	time.Sleep(d)
+}
+
+// send issues a single HTTP request. The caller must close resp.Body.
+func (c *Client) send(method, path string, query url.Values) (*http.Response, *url.URL, error) {
 	u, err := url.Parse(c.BaseURL + path)
 	if err != nil {
-		return nil, fmt.Errorf("parse url: %w", err)
+		return nil, nil, fmt.Errorf("parse url: %w", err)
 	}
 	if query != nil {
 		u.RawQuery = query.Encode()
@@ -53,88 +120,162 @@ func (c *Client) do(method, path string, query url.Values) ([]byte, error) {
 
 	req, err := http.NewRequest(method, u.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+		return nil, u, fmt.Errorf("create request: %w", err)
 	}
 	req.SetBasicAuth(c.Email, c.APIToken)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.HTTPClient.Do(req)
+	return resp, u, err
+}
+
+// doWithRetry executes a request with retry + rate-limit handling and returns
+// the final successful response. The caller must close resp.Body.
+//
+// Retryable conditions (up to MaxRetries extra attempts):
+//   - network errors (timeouts, connection resets, etc.)
+//   - HTTP 429, honoring the Retry-After header (capped at 60s)
+//   - HTTP 5xx, with exponential backoff
+//
+// Non-retryable conditions:
+//   - HTTP 401/403 → *AuthError
+//   - other non-2xx → *APIError
+func (c *Client) doWithRetry(method, path string, query url.Values) (*http.Response, error) {
+	maxAttempts := c.maxRetries() + 1
+	var lastErr error
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		resp, u, err := c.send(method, path, query)
+		if err != nil {
+			lastErr = fmt.Errorf("http request: %w", err)
+			if attempt < maxAttempts-1 {
+				wait := c.backoff(attempt)
+				c.logf("connection error, retrying in %s: %v", wait, err)
+				c.sleepFor(wait)
+				continue
+			}
+			return nil, lastErr
+		}
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			c.logf("response: %d %s", resp.StatusCode, resp.Status)
+			return resp, nil
+		}
+
+		// 401/403 — no retry, caller needs to update credentials.
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			drainAndClose(resp)
+			return nil, &AuthError{Status: resp.StatusCode, URL: u.String()}
+		}
+
+		// 429 — rate limited. Honor Retry-After (cap at 60s).
+		if resp.StatusCode == http.StatusTooManyRequests && attempt < maxAttempts-1 {
+			wait := parseRetryAfter(resp.Header.Get("Retry-After"), c.backoff(attempt))
+			if wait > maxRetryAfter {
+				wait = maxRetryAfter
+			}
+			drainAndClose(resp)
+			c.logf("rate limited, retrying in %s", wait)
+			c.sleepFor(wait)
+			continue
+		}
+
+		// 5xx — retry with exponential backoff.
+		if resp.StatusCode >= 500 && attempt < maxAttempts-1 {
+			wait := c.backoff(attempt)
+			c.logf("server error %d, retrying in %s", resp.StatusCode, wait)
+			drainAndClose(resp)
+			c.sleepFor(wait)
+			continue
+		}
+
+		return nil, buildAPIError(resp, u.String())
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("max retries exceeded")
+	}
+	return nil, lastErr
+}
+
+// do executes a request and returns the response body.
+func (c *Client) do(method, path string, query url.Values) ([]byte, error) {
+	resp, err := c.doWithRetry(method, path, query)
 	if err != nil {
-		c.logf("request failed: %v", err)
-		return nil, fmt.Errorf("http request: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
-
-	c.logf("response: %d %s", resp.StatusCode, resp.Status)
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read body: %w", err)
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		msg := strings.TrimSpace(string(body))
-		if strings.HasPrefix(msg, "<") || strings.Contains(msg, "<!DOCTYPE") {
-			msg = http.StatusText(resp.StatusCode)
-			if msg == "" {
-				msg = "unknown error"
-			}
-		} else if len(msg) > 200 {
-			msg = msg[:200] + "..."
-		}
-		return nil, fmt.Errorf("api error (status %d): %s", resp.StatusCode, msg)
-	}
-
 	c.logf("body: %d bytes", len(body))
-
 	return body, nil
 }
 
-// doRaw executes an authenticated request and returns the raw response.
+// doRaw executes a request and returns the raw response for streaming.
 // The caller is responsible for closing the response body.
 func (c *Client) doRaw(method, path string, query url.Values) (*http.Response, error) {
-	u, err := url.Parse(c.BaseURL + path)
-	if err != nil {
-		return nil, fmt.Errorf("parse url: %w", err)
+	return c.doWithRetry(method, path, query)
+}
+
+// backoff returns the wait duration for the given zero-indexed retry attempt.
+// Produces 1s, 2s, 4s, 8s, ... capped at MaxBackoff.
+func (c *Client) backoff(attempt int) time.Duration {
+	wait := time.Duration(1<<attempt) * time.Second
+	if max := c.maxBackoff(); wait > max {
+		wait = max
 	}
-	if query != nil {
-		u.RawQuery = query.Encode()
+	return wait
+}
+
+// parseRetryAfter decodes a Retry-After header value (seconds or HTTP-date).
+// Returns fallback if the value is missing or unparseable.
+func parseRetryAfter(val string, fallback time.Duration) time.Duration {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return fallback
 	}
-
-	c.logf("%s %s", method, u.String())
-
-	req, err := http.NewRequest(method, u.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
+	if secs, err := strconv.Atoi(val); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
 	}
-	req.SetBasicAuth(c.Email, c.APIToken)
-
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		c.logf("request failed: %v", err)
-		return nil, fmt.Errorf("http request: %w", err)
-	}
-
-	c.logf("response: %d %s", resp.StatusCode, resp.Status)
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		msg := strings.TrimSpace(string(body))
-		// If the response is HTML (e.g. a JIRA/Confluence 404 page), replace
-		// the verbose markup with a short status description.
-		if strings.HasPrefix(msg, "<") || strings.Contains(msg, "<!DOCTYPE") {
-			msg = http.StatusText(resp.StatusCode)
-			if msg == "" {
-				msg = "unknown error"
-			}
-		} else if len(msg) > 200 {
-			msg = msg[:200] + "..."
+	if t, err := http.ParseTime(val); err == nil {
+		d := time.Until(t)
+		if d < 0 {
+			return fallback
 		}
-		return nil, fmt.Errorf("api error (status %d): %s", resp.StatusCode, msg)
+		return d
 	}
+	return fallback
+}
 
-	return resp, nil
+// buildAPIError builds an *APIError from a non-2xx response, truncating HTML
+// bodies to a short status description so error output stays readable.
+func buildAPIError(resp *http.Response, u string) error {
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	msg := strings.TrimSpace(string(body))
+	if strings.HasPrefix(msg, "<") || strings.Contains(msg, "<!DOCTYPE") {
+		msg = http.StatusText(resp.StatusCode)
+		if msg == "" {
+			msg = "unknown error"
+		}
+	} else if len(msg) > 200 {
+		msg = msg[:200] + "..."
+	}
+	return &APIError{Status: resp.StatusCode, Body: msg, URL: u}
+}
+
+// drainAndClose discards the response body so the connection can be reused,
+// then closes it. Used before retrying.
+func drainAndClose(resp *http.Response) {
+	if resp == nil {
+		return
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 }
 
 // paginate fetches all pages of results for a given endpoint.

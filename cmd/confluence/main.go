@@ -1,9 +1,9 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
-	"strings"
 
 	"github.com/pspoerri/confluence-reader/internal/cli"
 	"github.com/pspoerri/confluence-reader/internal/ui"
@@ -12,29 +12,21 @@ import (
 const usage = `confluence-reader - browse Confluence spaces like a filesystem
 
 Usage:
-  confluence-reader [options] <command> [args...]
-
-Options:
-  -v, --verbose                          Enable verbose/debug output
+  confluence-reader [-v] <command> [flags] [args...]
 
 Commands:
-  configure                              Set up Confluence credentials
-  spaces                                 List all accessible spaces
-  ls [-l] [-a] [-r] <space-key> [page-id|/path]
-                                         List child pages (like unix ls)
-  tree [-r] <space-key>                  List page tree in a space
-  find [-r] <space-key> [query]          Find pages by title (or list all)
-  read [-r] <space-key> <page-id|/path>  Read a page as markdown
-  read-file [-r] <space-key> <page-id|/path> <filename>
-                                         Download an attachment
-  mirror [-a] [-r] <space-key> <target-dir>
-                                         Mirror entire space to local directory
-  refresh <space-key>                    Refresh the local cache for a space
+  configure                 Set up Confluence credentials
+  spaces                    List all accessible spaces
+  ls                        List child pages and attachments (like unix ls)
+  tree                      Show the full page hierarchy
+  find                      Find pages by title (or list all)
+  read                      Read a page as markdown
+  read-file                 Download an attachment
+  mirror                    Mirror a space to a local directory
+  refresh                   Force-refresh the local cache for a space
+  help [<command>]          Show this help, or help for a specific command
 
-Flags:
-  -l, --long       Show detailed listing (ls only)
-  -a, --all        Include all attachments, not just those referenced in the page
-  -r, --refresh    Force a cache refresh before running the command
+Run 'confluence-reader <command> --help' for command-specific flags.
 
 Configuration:
   Run 'confluence-reader configure' to set up your credentials.
@@ -49,13 +41,33 @@ Configuration:
     "api_token": "your-api-token"
   }
 
-Environment:
-  Cache is stored in ~/.config/confluence-reader/cache/
+  Cache is stored in ~/.config/confluence-reader/cache/.
 `
 
+// command bundles a subcommand's name, help text, and handler.
+type command struct {
+	name    string
+	summary string
+	run     func(app *cli.App, args []string) error
+}
+
+// commands is the registry of subcommands that need an authenticated App.
+// configure / help / spaces are handled separately in main.
+var commands = []command{
+	{"spaces", "List all accessible spaces", runSpaces},
+	{"ls", "List child pages and attachments", runLs},
+	{"tree", "Show the page hierarchy", runTree},
+	{"find", "Find pages by title", runFind},
+	{"read", "Read a page as markdown", runRead},
+	{"read-file", "Download an attachment", runReadFile},
+	{"mirror", "Mirror a space to a local directory", runMirror},
+	{"refresh", "Force-refresh the local cache for a space", runRefresh},
+}
+
 func main() {
-	// Parse global flags before the command.
 	args := os.Args[1:]
+
+	// Extract the global -v/--verbose flag wherever it appears before the command.
 	verbose := false
 	for len(args) > 0 && (args[0] == "-v" || args[0] == "--verbose") {
 		verbose = true
@@ -69,13 +81,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	cmd := args[0]
-	args = args[1:]
+	name := args[0]
+	rest := args[1:]
 
-	// Handle commands that work without a config file.
-	switch cmd {
+	// Commands that don't need a configured client.
+	switch name {
 	case "help", "-h", "--help":
-		fmt.Fprint(os.Stdout, usage)
+		printHelp(rest)
 		return
 	case "configure":
 		if err := cli.RunConfigure(out); err != nil {
@@ -85,131 +97,220 @@ func main() {
 		return
 	}
 
+	cmd, ok := lookupCommand(name)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", name)
+		fmt.Fprint(os.Stderr, usage)
+		os.Exit(1)
+	}
+
 	app, err := cli.NewApp(verbose, out)
 	if err != nil {
 		out.Errorf("%v", err)
 		os.Exit(1)
 	}
 
-	switch cmd {
-	case "spaces":
-		err = app.RunSpaces()
-
-	case "ls":
-		longFormat := false
-		allFiles := false
-		refresh := false
-		lsArgs := args
-		for len(lsArgs) > 0 && strings.HasPrefix(lsArgs[0], "-") {
-			switch lsArgs[0] {
-			case "-l", "--long":
-				longFormat = true
-			case "-a", "--all":
-				allFiles = true
-			case "-r", "--refresh":
-				refresh = true
-			default:
-				die("ls: unknown flag: " + lsArgs[0])
-			}
-			lsArgs = lsArgs[1:]
-		}
-		if len(lsArgs) < 1 {
-			die("usage: confluence-reader ls [-l] [-a] [-r] <space-key> [page-id|/path]")
-		}
-		target := ""
-		if len(lsArgs) >= 2 {
-			target = lsArgs[1]
-		}
-		err = app.RunLs(lsArgs[0], target, longFormat, allFiles, refresh)
-
-	case "tree":
-		refresh, cmdArgs := parseRefreshFlag(args)
-		if len(cmdArgs) < 1 {
-			die("usage: confluence-reader tree [-r] <space-key>")
-		}
-		err = app.RunTree(cmdArgs[0], refresh)
-
-	case "find":
-		refresh, cmdArgs := parseRefreshFlag(args)
-		if len(cmdArgs) < 1 {
-			die("usage: confluence-reader find [-r] <space-key> [query]")
-		}
-		query := ""
-		if len(cmdArgs) >= 2 {
-			query = cmdArgs[1]
-		}
-		err = app.RunFind(cmdArgs[0], query, refresh)
-
-	case "read":
-		refresh, cmdArgs := parseRefreshFlag(args)
-		if len(cmdArgs) < 2 {
-			die("usage: confluence-reader read [-r] <space-key> <page-id|/path>")
-		}
-		err = app.RunRead(cmdArgs[0], cmdArgs[1], refresh)
-
-	case "read-file":
-		refresh, cmdArgs := parseRefreshFlag(args)
-		if len(cmdArgs) < 3 {
-			die("usage: confluence-reader read-file [-r] <space-key> <page-id|/path> <filename>")
-		}
-		err = app.RunReadFile(cmdArgs[0], cmdArgs[1], cmdArgs[2], refresh)
-
-	case "mirror":
-		allFiles := false
-		refresh := false
-		mirrorArgs := args
-		for len(mirrorArgs) > 0 && strings.HasPrefix(mirrorArgs[0], "-") {
-			switch mirrorArgs[0] {
-			case "-a", "--all":
-				allFiles = true
-			case "-r", "--refresh":
-				refresh = true
-			default:
-				die("mirror: unknown flag: " + mirrorArgs[0])
-			}
-			mirrorArgs = mirrorArgs[1:]
-		}
-		if len(mirrorArgs) < 2 {
-			die("usage: confluence-reader mirror [-a] [-r] <space-key> <target-dir>")
-		}
-		err = app.RunMirror(mirrorArgs[0], mirrorArgs[1], allFiles, refresh)
-
-	case "refresh":
-		if len(args) < 1 {
-			die("usage: confluence-reader refresh <space-key>")
-		}
-		err = app.RunRefresh(args[0])
-
-	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", cmd)
-		fmt.Fprint(os.Stderr, usage)
-		os.Exit(1)
-	}
-
-	if err != nil {
+	if err := cmd.run(app, rest); err != nil {
 		out.Errorf("%v", err)
 		os.Exit(1)
 	}
 }
 
-// parseRefreshFlag extracts -r/--refresh from arguments, returning the
-// flag value and the remaining arguments.
-func parseRefreshFlag(args []string) (bool, []string) {
-	refresh := false
-	remaining := args
-	for len(remaining) > 0 && strings.HasPrefix(remaining[0], "-") {
-		switch remaining[0] {
-		case "-r", "--refresh":
-			refresh = true
-		default:
-			die("unknown flag: " + remaining[0])
+func lookupCommand(name string) (command, bool) {
+	for _, c := range commands {
+		if c.name == name {
+			return c, true
 		}
-		remaining = remaining[1:]
 	}
-	return refresh, remaining
+	return command{}, false
 }
 
-func die(msg string) {
-	fmt.Fprintln(os.Stderr, msg)
-	os.Exit(1)
+// printHelp prints the global usage or, if a command name is given, that
+// command's --help output.
+func printHelp(args []string) {
+	if len(args) == 0 {
+		fmt.Fprint(os.Stdout, usage)
+		return
+	}
+	cmd, ok := lookupCommand(args[0])
+	if !ok {
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n", args[0])
+		os.Exit(1)
+	}
+	// Trigger the subcommand's own --help via FlagSet. Each handler creates
+	// its own FlagSet, so we invoke the handler with --help and let it exit.
+	_ = cmd.run(nil, []string{"--help"})
+}
+
+// newFlagSet returns a FlagSet whose usage line shows the given positional
+// args after the command name.
+func newFlagSet(name, positional string) *flag.FlagSet {
+	fs := flag.NewFlagSet(name, flag.ExitOnError)
+	fs.Usage = func() {
+		header := fmt.Sprintf("Usage: confluence-reader %s [flags]", name)
+		if positional != "" {
+			header += " " + positional
+		}
+		fmt.Fprintln(fs.Output(), header)
+		fmt.Fprintln(fs.Output(), "\nFlags:")
+		fs.PrintDefaults()
+	}
+	return fs
+}
+
+// boolFlag registers both -short and --long for the same target variable so
+// users can write either form.
+func boolFlag(fs *flag.FlagSet, target *bool, short, long, usage string) {
+	fs.BoolVar(target, short, false, usage)
+	fs.BoolVar(target, long, false, usage+" (alias)")
+}
+
+// requireArgs prints the FlagSet usage and returns an error if argc is below min.
+func requireArgs(fs *flag.FlagSet, args []string, min int) error {
+	if len(args) < min {
+		fs.Usage()
+		return fmt.Errorf("missing required arguments")
+	}
+	return nil
+}
+
+// --- subcommand handlers ---------------------------------------------------
+
+func runSpaces(app *cli.App, args []string) error {
+	fs := newFlagSet("spaces", "")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if app == nil {
+		return nil
+	}
+	return app.RunSpaces()
+}
+
+func runLs(app *cli.App, args []string) error {
+	fs := newFlagSet("ls", "<space-key> [page-id|/path]")
+	var longFormat, allFiles, refresh bool
+	boolFlag(fs, &longFormat, "l", "long", "Detailed listing (permissions, timestamps, authors)")
+	boolFlag(fs, &allFiles, "a", "all", "Include all attachments, not just those referenced in the page")
+	boolFlag(fs, &refresh, "r", "refresh", "Force a cache refresh before running")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if app == nil {
+		return nil
+	}
+	rest := fs.Args()
+	if err := requireArgs(fs, rest, 1); err != nil {
+		return err
+	}
+	target := ""
+	if len(rest) >= 2 {
+		target = rest[1]
+	}
+	return app.RunLs(rest[0], target, longFormat, allFiles, refresh)
+}
+
+func runTree(app *cli.App, args []string) error {
+	fs := newFlagSet("tree", "<space-key>")
+	var refresh bool
+	boolFlag(fs, &refresh, "r", "refresh", "Force a cache refresh before running")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if app == nil {
+		return nil
+	}
+	rest := fs.Args()
+	if err := requireArgs(fs, rest, 1); err != nil {
+		return err
+	}
+	return app.RunTree(rest[0], refresh)
+}
+
+func runFind(app *cli.App, args []string) error {
+	fs := newFlagSet("find", "<space-key> [query]")
+	var refresh bool
+	boolFlag(fs, &refresh, "r", "refresh", "Force a cache refresh before running")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if app == nil {
+		return nil
+	}
+	rest := fs.Args()
+	if err := requireArgs(fs, rest, 1); err != nil {
+		return err
+	}
+	query := ""
+	if len(rest) >= 2 {
+		query = rest[1]
+	}
+	return app.RunFind(rest[0], query, refresh)
+}
+
+func runRead(app *cli.App, args []string) error {
+	fs := newFlagSet("read", "<space-key> <page-id|/path>")
+	var refresh bool
+	boolFlag(fs, &refresh, "r", "refresh", "Force a cache refresh before running")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if app == nil {
+		return nil
+	}
+	rest := fs.Args()
+	if err := requireArgs(fs, rest, 2); err != nil {
+		return err
+	}
+	return app.RunRead(rest[0], rest[1], refresh)
+}
+
+func runReadFile(app *cli.App, args []string) error {
+	fs := newFlagSet("read-file", "<space-key> <page-id|/path> <filename>")
+	var refresh bool
+	boolFlag(fs, &refresh, "r", "refresh", "Force a cache refresh before running")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if app == nil {
+		return nil
+	}
+	rest := fs.Args()
+	if err := requireArgs(fs, rest, 3); err != nil {
+		return err
+	}
+	return app.RunReadFile(rest[0], rest[1], rest[2], refresh)
+}
+
+func runMirror(app *cli.App, args []string) error {
+	fs := newFlagSet("mirror", "<space-key> <target-dir>")
+	var allFiles, refresh bool
+	boolFlag(fs, &allFiles, "a", "all", "Include all attachments, not just those referenced in pages")
+	boolFlag(fs, &refresh, "r", "refresh", "Force a cache refresh before running")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if app == nil {
+		return nil
+	}
+	rest := fs.Args()
+	if err := requireArgs(fs, rest, 2); err != nil {
+		return err
+	}
+	return app.RunMirror(rest[0], rest[1], allFiles, refresh)
+}
+
+func runRefresh(app *cli.App, args []string) error {
+	fs := newFlagSet("refresh", "<space-key>")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if app == nil {
+		return nil
+	}
+	rest := fs.Args()
+	if err := requireArgs(fs, rest, 1); err != nil {
+		return err
+	}
+	return app.RunRefresh(rest[0])
 }

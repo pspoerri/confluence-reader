@@ -594,7 +594,9 @@ func (a *App) RunRefresh(spaceKey string) error {
 }
 
 // mirrorWorkers caps the number of concurrent page-processing goroutines.
-const mirrorWorkers = 8
+// Kept low because Confluence Cloud throttles aggressively above a small
+// concurrency level — higher values trigger 429s and end up slower overall.
+const mirrorWorkers = 2
 
 // pageJob is one page's worth of work prepared in mirror's serial phase 1
 // and consumed by parallel workers in phase 2.
@@ -610,14 +612,20 @@ type pageJob struct {
 // Each page becomes a folder with an index.md file and its attachments.
 // When allFiles is false, only attachments referenced in the page body are downloaded.
 //
-// Mirror runs in two phases:
+// Producer/consumer pipeline:
 //
-//   - Phase 1 (serial): walk the page tree, mkdir each page directory,
-//     fetch attachment listings (which write to cs), and build per-page
-//     rename maps. This must be serial because cs is mutated.
-//   - Phase 2 (parallel): a worker pool fetches page bodies, converts to
-//     markdown, writes index.md, and downloads attachments. cs is read-only
-//     here; only the shared `written` map and progress bar take a lock.
+//   - The producer (this goroutine) walks the page tree, mkdir-s each page
+//     directory, fetches the attachment listing for each page, and pushes a
+//     pageJob onto a channel.
+//   - mirrorWorkers worker goroutines drain that channel concurrently:
+//     fetch page body, convert to markdown, write index.md, download
+//     attachments, render any drawio diagrams.
+//
+// The producer must run serially because EnsureAttachments mutates cs. The
+// pipeline overlaps producer and worker time so the progress bar advances as
+// soon as the first job completes (around the time the producer is fetching
+// the second page's attachments). cs.RenamedFiles updates are deferred to a
+// post-pipeline pass to keep workers' map reads race-free.
 func (a *App) RunMirror(spaceKey, targetDir string, allFiles, refresh bool) error {
 	space, err := a.resolveSpace(spaceKey)
 	if err != nil {
@@ -663,35 +671,100 @@ func (a *App) RunMirror(spaceKey, targetDir string, allFiles, refresh bool) erro
 		}
 	}
 
-	// Track all paths written during this mirror run.
+	// Track all paths written during this mirror run. Mutex-guarded since
+	// the producer (mkdir) and workers (file writes) both append to it.
 	written := make(map[string]bool)
+	var writeMu sync.Mutex
+	markWritten := func(path string) {
+		writeMu.Lock()
+		written[path] = true
+		writeMu.Unlock()
+	}
 
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
 		return fmt.Errorf("create target directory: %w", err)
 	}
 
-	// Phase 1: build the directory tree, fetch attachment listings, and
-	// emit one pageJob per page.
-	var jobs []pageJob
-	if homepageNode != nil {
-		job, err := a.prepareJob(cs, homepageNode.Page.ID, homepageNode.Page.Title, targetDir, written)
-		if err != nil {
-			return fmt.Errorf("prepare homepage: %w", err)
+	// Spin up workers, then stream jobs from the producer.
+	var (
+		errOnce  sync.Once
+		firstErr error
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	captureErr := func(err error) {
+		if err == nil {
+			return
 		}
-		jobs = append(jobs, job)
+		errOnce.Do(func() {
+			firstErr = err
+			cancel()
+		})
 	}
-	for _, node := range displayRoots {
-		if err := a.collectJobs(cs, node, targetDir, written, &jobs); err != nil {
-			return err
+
+	// Buffered so the producer can stay a few jobs ahead of the workers
+	// without blocking on every send.
+	jobCh := make(chan pageJob, mirrorWorkers*2)
+	var wg sync.WaitGroup
+	for i := 0; i < mirrorWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobCh {
+				if ctx.Err() != nil {
+					continue // drain remaining jobs after cancellation
+				}
+				if err := a.processJob(cs, job, allFiles, bar, markWritten); err != nil {
+					captureErr(err)
+				}
+			}
+		}()
+	}
+
+	// Producer: walk the tree and feed jobs to the workers.
+	var jobs []pageJob
+	emit := func(job pageJob) bool {
+		jobs = append(jobs, job)
+		select {
+		case <-ctx.Done():
+			return false
+		case jobCh <- job:
+			return true
 		}
 	}
 
-	// Phase 2: parallel fan-out.
-	err = a.runMirrorWorkers(cs, jobs, allFiles, bar, written)
-	bar.Finish()
-	if err != nil {
-		return err
+	produce := func() error {
+		if homepageNode != nil {
+			job, err := a.prepareJob(cs, homepageNode.Page.ID, homepageNode.Page.Title, targetDir, markWritten)
+			if err != nil {
+				return fmt.Errorf("prepare homepage: %w", err)
+			}
+			if !emit(job) {
+				return nil
+			}
+		}
+		for _, node := range displayRoots {
+			if err := a.streamJobs(ctx, cs, node, targetDir, markWritten, emit); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
+
+	if err := produce(); err != nil {
+		captureErr(err)
+	}
+	close(jobCh)
+	wg.Wait()
+	bar.Finish()
+
+	if firstErr != nil {
+		return firstErr
+	}
+
+	// Persist rename info now that no workers are reading cs.RenamedFiles.
+	updateRenameCache(cs, jobs)
 
 	if err := writeSyncMetadata(targetDir, spaceKey, total); err != nil {
 		return fmt.Errorf("write sync metadata: %w", err)
@@ -710,26 +783,32 @@ func (a *App) RunMirror(spaceKey, targetDir string, allFiles, refresh bool) erro
 	return nil
 }
 
-// collectJobs walks the page subtree rooted at node, mkdir-ing each page
-// directory and emitting a pageJob per page. Runs serially because both the
-// directory creation and prepareJob mutate shared state.
-func (a *App) collectJobs(cs *cache.CachedSpace, node *cache.PageNode, parentDir string, written map[string]bool, jobs *[]pageJob) error {
+// streamJobs walks node's subtree, mkdir-ing each page directory and emitting
+// one pageJob per page via emit. emit returns false when the consumer side has
+// cancelled and the walk should stop early.
+func (a *App) streamJobs(ctx context.Context, cs *cache.CachedSpace, node *cache.PageNode, parentDir string, markWritten func(string), emit func(pageJob) bool) error {
+	if ctx.Err() != nil {
+		return nil
+	}
+
 	dirName := sanitizeFilename(node.Page.Title)
 	dir := filepath.Join(parentDir, dirName)
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create directory %s: %w", dir, err)
 	}
-	written[dir] = true
+	markWritten(dir)
 
-	job, err := a.prepareJob(cs, node.Page.ID, node.Page.Title, dir, written)
+	job, err := a.prepareJob(cs, node.Page.ID, node.Page.Title, dir, markWritten)
 	if err != nil {
 		return err
 	}
-	*jobs = append(*jobs, job)
+	if !emit(job) {
+		return nil
+	}
 
 	for _, child := range node.Children {
-		if err := a.collectJobs(cs, child, dir, written, jobs); err != nil {
+		if err := a.streamJobs(ctx, cs, child, dir, markWritten, emit); err != nil {
 			return err
 		}
 	}
@@ -737,30 +816,19 @@ func (a *App) collectJobs(cs *cache.CachedSpace, node *cache.PageNode, parentDir
 }
 
 // prepareJob fetches the attachment listing for a page (cached in cs) and
-// builds the rename map, recording it in cs.RenamedFiles so that subsequent
-// mirror runs can skip already-downloaded attachments.
-func (a *App) prepareJob(cs *cache.CachedSpace, pageID, pageTitle, dir string, written map[string]bool) (pageJob, error) {
+// builds the rename map. cs.RenamedFiles is intentionally NOT updated here:
+// workers read it concurrently via downloadAttachment and a write would race.
+// updateRenameCache flushes the new entries once the worker pool drains.
+func (a *App) prepareJob(cs *cache.CachedSpace, pageID, pageTitle, dir string, markWritten func(string)) (pageJob, error) {
+	_ = markWritten // currently unused; reserved for future per-page metadata files
 	attachments, err := a.Cache.EnsureAttachments(a.Client, cs, pageID)
 	if err != nil {
 		return pageJob{}, fmt.Errorf("fetch attachments for page %s: %w", pageID, err)
 	}
 
 	renameMap := make(map[string]string, len(attachments))
-	if cs.RenamedFiles == nil {
-		cs.RenamedFiles = make(map[string]map[string]cache.RenameEntry)
-	}
-	if cs.RenamedFiles[pageID] == nil {
-		cs.RenamedFiles[pageID] = make(map[string]cache.RenameEntry)
-	}
 	for _, att := range attachments {
-		newName := convert.RenameAttachment(pageTitle, att.Title, att.ID)
-		renameMap[att.Title] = newName
-		cs.RenamedFiles[pageID][att.Title] = cache.RenameEntry{
-			NewName:   newName,
-			FileID:    att.FileID,
-			VersionNo: att.Version.Number,
-			FileSize:  att.FileSize,
-		}
+		renameMap[att.Title] = convert.RenameAttachment(pageTitle, att.Title, att.ID)
 	}
 
 	return pageJob{
@@ -772,62 +840,32 @@ func (a *App) prepareJob(cs *cache.CachedSpace, pageID, pageTitle, dir string, w
 	}, nil
 }
 
-// runMirrorWorkers processes pageJobs in parallel. cs must be read-only here:
-// the resolver only reads cs.Pages and cs.Children (both fully populated by
-// EnsureFullTree) and we never call EnsureAttachments/EnsureChildren in this
-// phase. Returns the first error from any worker; once captured, subsequent
-// jobs are drained without execution.
-func (a *App) runMirrorWorkers(cs *cache.CachedSpace, jobs []pageJob, allFiles bool, bar *progress.Bar, written map[string]bool) error {
-	if len(jobs) == 0 {
-		return nil
+// updateRenameCache writes the rename info for every job into cs.RenamedFiles
+// so subsequent mirror runs can skip already-downloaded attachments. Must run
+// after the worker pool has drained, since workers read cs.RenamedFiles and
+// concurrent map writes would race.
+func updateRenameCache(cs *cache.CachedSpace, jobs []pageJob) {
+	if cs.RenamedFiles == nil {
+		cs.RenamedFiles = make(map[string]map[string]cache.RenameEntry, len(jobs))
 	}
-
-	var (
-		errOnce  sync.Once
-		firstErr error
-		writeMu  sync.Mutex
-	)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	markWritten := func(path string) {
-		writeMu.Lock()
-		written[path] = true
-		writeMu.Unlock()
-	}
-
-	jobCh := make(chan pageJob)
-	var wg sync.WaitGroup
-	for i := 0; i < mirrorWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for job := range jobCh {
-				if ctx.Err() != nil {
-					continue // drain remaining jobs after cancellation
-				}
-				if err := a.processJob(cs, job, allFiles, bar, markWritten); err != nil {
-					errOnce.Do(func() {
-						firstErr = err
-						cancel()
-					})
-				}
-			}
-		}()
-	}
-
 	for _, job := range jobs {
-		select {
-		case <-ctx.Done():
-		case jobCh <- job:
+		if len(job.attachments) == 0 {
 			continue
 		}
-		break
+		entries := cs.RenamedFiles[job.pageID]
+		if entries == nil {
+			entries = make(map[string]cache.RenameEntry, len(job.attachments))
+			cs.RenamedFiles[job.pageID] = entries
+		}
+		for _, att := range job.attachments {
+			entries[att.Title] = cache.RenameEntry{
+				NewName:   job.renameMap[att.Title],
+				FileID:    att.FileID,
+				VersionNo: att.Version.Number,
+				FileSize:  att.FileSize,
+			}
+		}
 	}
-	close(jobCh)
-	wg.Wait()
-
-	return firstErr
 }
 
 // processJob fetches a page body, converts to markdown, writes index.md,
@@ -864,6 +902,18 @@ func (a *App) processJob(cs *cache.CachedSpace, job pageJob, allFiles bool, bar 
 	// Catch any remaining attachment: references (shouldn't happen, but safety).
 	md = strings.ReplaceAll(md, "(attachment:", "(")
 
+	downloadAtts := job.attachments
+	if !allFiles {
+		referenced := convert.ReferencedAttachments(body)
+		var filtered []api.Attachment
+		for _, att := range job.attachments {
+			if referenced[att.Title] {
+				filtered = append(filtered, att)
+			}
+		}
+		downloadAtts = filtered
+	}
+
 	fm := Frontmatter{
 		Title:      page.Title,
 		PageID:     page.ID,
@@ -884,18 +934,6 @@ func (a *App) processJob(cs *cache.CachedSpace, job pageJob, allFiles bool, bar 
 	}
 	markWritten(indexPath)
 	bar.Increment()
-
-	downloadAtts := job.attachments
-	if !allFiles {
-		referenced := convert.ReferencedAttachments(body)
-		var filtered []api.Attachment
-		for _, att := range job.attachments {
-			if referenced[att.Title] {
-				filtered = append(filtered, att)
-			}
-		}
-		downloadAtts = filtered
-	}
 
 	for _, att := range downloadAtts {
 		newName := job.renameMap[att.Title]

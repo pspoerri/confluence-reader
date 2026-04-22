@@ -903,7 +903,9 @@ func collectAllText(n *node) string {
 }
 
 // ReferencedAttachments returns the set of attachment filenames that are
-// referenced in the Confluence storage-format HTML (via <ri:attachment>).
+// referenced in the Confluence storage-format HTML — via <ri:attachment>
+// (images, attachment links, view-file macros) or via the diagramName
+// parameter of drawio macros (where the attachment is the .drawio file).
 func ReferencedAttachments(storageHTML string) map[string]bool {
 	s := rewriteNamespaces(storageHTML)
 
@@ -915,9 +917,22 @@ func ReferencedAttachments(storageHTML string) map[string]bool {
 	result := make(map[string]bool)
 	var walk func(*node)
 	walk = func(n *node) {
-		if n.kind == elementNode && n.data == "ri-attachment" {
-			if filename := attr(n, "ri-filename"); filename != "" {
-				result[filename] = true
+		if n.kind == elementNode {
+			switch n.data {
+			case "ri-attachment":
+				if filename := attr(n, "ri-filename"); filename != "" {
+					result[filename] = true
+				}
+			case "ac-structured-macro":
+				name := attr(n, "ac-name")
+				if name == "drawio" || name == "inc-drawio" || name == "drawio-sketch" {
+					if diagram := macroParam(n, "diagramName"); diagram != "" {
+						if !strings.HasSuffix(strings.ToLower(diagram), ".drawio") {
+							diagram += ".drawio"
+						}
+						result[diagram] = true
+					}
+				}
 			}
 		}
 		for child := n.firstChild; child != nil; child = child.nextSibling {

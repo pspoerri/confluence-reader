@@ -1,7 +1,7 @@
 // Package version reports the binary's version, git commit, and build time.
-// All values come from runtime/debug.ReadBuildInfo, which Go populates from
-// the module cache (when installed via `go install`) and the embedded VCS
-// metadata (when built from a git checkout). No -ldflags trickery required.
+// Values are preferentially taken from linker-injected variables (set by the
+// Makefile via `-ldflags -X`); when unset (e.g. for `go install` builds),
+// Read falls back to runtime/debug.ReadBuildInfo and its embedded VCS metadata.
 package version
 
 import (
@@ -11,38 +11,70 @@ import (
 	"strings"
 )
 
+// Linker-injected values. Kept lowercase to avoid exporting them; set via
+// `-ldflags "-X github.com/pspoerri/confluence-reader/internal/version.ldX=..."`.
+var (
+	ldVersion string // e.g. "v1.2.3", "v1.2.3-5-gabcdef", or a short hash
+	ldCommit  string // full or short commit hash, optionally suffixed with "-dirty"
+	ldTime    string // RFC3339 build timestamp
+)
+
 // Info bundles the data shown by `confluence-reader version`.
 type Info struct {
-	Version  string // module version, "(devel)" when unset
+	Version  string // module version, "development build" when no git info is baked in
 	Commit   string // git commit short hash, empty when not available
 	Time     string // ISO-8601 commit timestamp, empty when not available
 	Modified bool   // true when built from a dirty working tree
 	Go       string // Go runtime version, e.g. "go1.26.1"
 }
 
-// Read extracts version information from the binary's embedded build info.
+// devBuild is the version string shown when no git metadata is baked in.
+const devBuild = "development build"
+
+// Read extracts version information, preferring linker-injected values and
+// falling back to the binary's embedded VCS metadata. When nothing is
+// available, the version reads "development build".
 func Read() Info {
 	info := Info{
-		Version: "(devel)",
-		Go:      runtime.Version(),
+		Go: runtime.Version(),
 	}
 
-	bi, ok := debug.ReadBuildInfo()
-	if !ok {
-		return info
+	if ldVersion != "" {
+		info.Version = ldVersion
 	}
-	if bi.Main.Version != "" && bi.Main.Version != "(devel)" {
-		info.Version = bi.Main.Version
+	if ldCommit != "" {
+		raw := strings.TrimSuffix(ldCommit, "-dirty")
+		info.Commit = shortHash(raw)
+		info.Modified = raw != ldCommit
 	}
-	for _, s := range bi.Settings {
-		switch s.Key {
-		case "vcs.revision":
-			info.Commit = shortHash(s.Value)
-		case "vcs.time":
-			info.Time = s.Value
-		case "vcs.modified":
-			info.Modified = s.Value == "true"
+	if ldTime != "" {
+		info.Time = ldTime
+	}
+
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		if info.Version == "" && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+			info.Version = bi.Main.Version
 		}
+		for _, s := range bi.Settings {
+			switch s.Key {
+			case "vcs.revision":
+				if info.Commit == "" {
+					info.Commit = shortHash(s.Value)
+				}
+			case "vcs.time":
+				if info.Time == "" {
+					info.Time = s.Value
+				}
+			case "vcs.modified":
+				if ldCommit == "" {
+					info.Modified = s.Value == "true"
+				}
+			}
+		}
+	}
+
+	if info.Version == "" {
+		info.Version = devBuild
 	}
 	return info
 }

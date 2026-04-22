@@ -6,8 +6,8 @@ import (
 )
 
 func TestInfo_String_DevelOnly(t *testing.T) {
-	got := Info{Version: "(devel)"}.String()
-	if got != "confluence-reader (devel)" {
+	got := Info{Version: devBuild}.String()
+	if got != "confluence-reader development build" {
 		t.Errorf("got %q", got)
 	}
 }
@@ -27,7 +27,7 @@ func TestInfo_String_WithDirtyCommit(t *testing.T) {
 }
 
 func TestInfo_Detailed_OmitsBlankFields(t *testing.T) {
-	got := Info{Version: "(devel)", Go: "go1.26.1"}.Detailed()
+	got := Info{Version: devBuild, Go: "go1.26.1"}.Detailed()
 	if strings.Contains(got, "commit:") {
 		t.Errorf("expected no commit line, got:\n%s", got)
 	}
@@ -81,7 +81,7 @@ func TestRead_ReturnsSomething(t *testing.T) {
 	if info.Go == "" {
 		t.Error("Go version should always be populated")
 	}
-	// Version should be either a semver, "(devel)", or some other non-empty token.
+	// Version should be a semver, "development build", or some other non-empty token.
 	if info.Version == "" {
 		t.Error("Version should never be empty")
 	}
